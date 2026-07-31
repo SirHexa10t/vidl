@@ -1,0 +1,16 @@
+# Build output
+/target/
+
+# Live credentials for the cookie-gated test — never committed. The README is the exception:
+# it is what tells the next person the slot exists. See tests/cookies/README.md.
+/tests/cookies/*
+!/tests/cookies/README.md
+
+# Backtrace/coredump droppings from panicking test runs
+*.rs.bk
+core
+
+# Editor / OS
+*.swp
+*~
+.DS_Store

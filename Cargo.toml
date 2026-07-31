@@ -1,0 +1,14 @@
+[package]
+name = "vidl"
+version = "0.1.0"
+edition = "2021"
+description = "Drive yt-dlp: classify a URL, resolve per-video subtitles, download, and patch the result"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+lofty = "0.24"          # in-place audio metadata writes — the subtitle tags on `--audio` downloads
+
+# Its own workspace root: `vidl` is an independent repo that bashrs happens to keep beside it
+# as a path dependency, so it must build exactly as it will once moved away.
+[workspace]
