@@ -87,7 +87,7 @@ use std::path::{Path, PathBuf};
 use crate::util::exec::run_reporting_code;
 use crate::util::style;
 use ytdlp::failures::{GeoRescue, diagnose_failure, scrub_ledger, write_ledger};
-use ytdlp::{ARCHIVE_NAME, CHANNEL_TABS, channel_tab_argv, generic_argv, playlist_argv, launch, video_argv, ytdlp_invocation};
+use ytdlp::{ARCHIVE_NAME, CHANNEL_TABS, channel_tab_argv, generic_argv, names, playlist_argv, launch, video_argv, ytdlp_invocation};
 use media::{embed_subtitles, embed_thumbnails, find_by_id, finish_media, patch_collection_subtitles};
 use ytdlp::scan::{ScanEntry, TabScan, archived_ids, is_tombstone, scan_playlist, scan_tab, unplayable_report};
 use media::subtitles::{Pick, Planned, batch_probe, default_picks, group_by_langs, video_picks};
@@ -234,6 +234,10 @@ pub fn download_video(url: &str, into: &Path, env: Env) -> i32 {
             }
         }
     }
+    // Beside the ledger scrub, and for the same reason: the end of a pass is where this crate
+    // reconciles what it knows against what is actually on disk. Late enough to include a name
+    // from a download that only came through on the diagnostic retry.
+    names::note_shortened(into);
     scrub_ledger(into);
     code
 }
@@ -271,6 +275,9 @@ pub fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
             Some(line) => write_ledger(into, &[line]),
         }
     }
+    // The path this matters most on: off YouTube the "title" is often a whole post caption, and
+    // an unbounded one is what made the file name unwritable in the first place.
+    names::note_shortened(into);
     scrub_ledger(into);
     code
 }
@@ -286,7 +293,9 @@ pub fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i32 {
              no unplayable report"
         );
         let keys: Vec<String> = default_picks().iter().map(|pick| pick.key.clone()).collect();
-        return launch(playlist_argv(url, into, into, env, &keys, None));
+        let code = launch(playlist_argv(url, into, into, env, &keys, None));
+        names::note_shortened(into);
+        return code;
     };
     // The playlist's folder, spelled exactly as yt-dlp's template expansion will spell it.
     let dir = scan.dirname.clone().unwrap_or_else(|| format!("[{id}]"));
@@ -399,6 +408,9 @@ fn download_pending(
         if code != 0 && worst == 0 {
             worst = code;
         }
+        // Per group rather than once at the end: a long collection should report a shortened name
+        // as the file lands, not in a batch after every group has run.
+        names::note_shortened(home);
         for plan in &group {
             finish_media(home, &plan.id, &plan.picks, env);
         }
@@ -429,6 +441,9 @@ fn download_pending(
             Some(line) => ledger.push(line),
         }
     }
+    // The post-mortem re-ran the entries that failed inside a group; any that came through on the
+    // retry named itself just now, after the per-group pass above had already run.
+    names::note_shortened(home);
     scrub_ledger(home);
     write_ledger(home, &ledger);
     worst

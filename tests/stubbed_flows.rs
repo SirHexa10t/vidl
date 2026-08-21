@@ -77,6 +77,26 @@ impl Rig {
     fn ledger(&self) -> String {
         fs::read_to_string(self.into.join(".dl_video_failed_download.txt")).unwrap_or_default()
     }
+
+    /// The shortened-name record inside `sub` (a collection folder, or `""` for the destination
+    /// root). Empty when there is no record — which is the normal case.
+    fn modified(&self, sub: &str) -> String {
+        fs::read_to_string(self.into.join(sub).join(".dl_video_modified")).unwrap_or_default()
+    }
+
+    /// Script what each successful download reports itself as having been called: one
+    /// `<id>\t<title>` line per video, exactly as yt-dlp's `--print-to-file` writes it.
+    fn names(&self, lines: &str) {
+        fs::write(self.stub.join("names_adds.txt"), lines).unwrap();
+    }
+}
+
+/// A title longer than the templates' byte budget, built rather than pasted so the test reads as
+/// the boundary it is testing.
+fn overlong_title() -> String {
+    let title = format!("A caption that keeps going {}", "and going ".repeat(20));
+    assert!(title.len() > 150, "the fixture must actually exceed the budget");
+    title
 }
 
 impl Drop for Rig {
@@ -87,6 +107,18 @@ impl Drop for Rig {
 
 fn text(out: &Output) -> String {
     format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+/// The *download* invocations among a run's calls, told apart by the one flag only a download
+/// carries: `--output`. Not by the absence of `--print` — every download argv now also carries
+/// `--print-to-file`, which is how a run learns the name each file was given.
+fn downloads(calls: &str) -> Vec<&str> {
+    calls.lines().filter(|line| line.contains("--output")).collect()
+}
+
+/// Every non-empty invocation in a run, for the paths whose contract is a specific *number* of them.
+fn invocations(calls: &str) -> Vec<&str> {
+    calls.lines().filter(|line| !line.trim().is_empty()).collect()
 }
 
 /// Skip-with-notice: `Some(None)` when PATH carries a usable ffmpeg+ffprobe (the only place this
@@ -259,7 +291,7 @@ fn a_playlist_scan_reports_tombstones_skips_archived_and_downloads_pending_in_on
         1,
         "one scan:\n{calls}"
     );
-    let downloads: Vec<&str> = calls.lines().filter(|line| !line.contains("--print")).collect();
+    let downloads = downloads(&calls);
     assert_eq!(downloads.len(), 1, "the shared subtitle plan downloads as one group:\n{calls}");
     assert!(downloads[0].contains("--playlist-items 1,4"), "both pending entries: {}", downloads[0]);
     // Two entries sit far under the pacing threshold — the probe must not sleep between requests.
@@ -309,7 +341,7 @@ fn a_channel_walks_every_tab_downloading_reporting_missing_and_failed_ones() {
     assert!(archive.contains("vidchan0001") && archive.contains("vidchan0002"), "{archive}");
     let calls = rig.calls();
     assert_eq!(calls.lines().filter(|line| line.contains("--flat-playlist")).count(), 4, "one scan per tab:\n{calls}");
-    let downloads: Vec<&str> = calls.lines().filter(|line| !line.contains("--print")).collect();
+    let downloads = downloads(&calls);
     assert_eq!(downloads.len(), 1, "the videos tab downloads as one group:\n{calls}");
 }
 
@@ -415,7 +447,7 @@ fn a_non_youtube_url_takes_the_flat_generic_path_not_the_youtube_one() {
 
     assert!(calls.contains("--no-playlist"), "the generic path pins one video:\n{calls}");
     assert!(
-        calls.contains("%(title)s [%(id)s].%(ext)s"),
+        calls.contains("%(title).150B [%(id)s].%(ext)s"),
         "flat generic naming, not the YouTube date/title/id template:\n{calls}"
     );
     assert!(
@@ -426,15 +458,129 @@ fn a_non_youtube_url_takes_the_flat_generic_path_not_the_youtube_one() {
         !calls.contains("--write-subs") && !calls.contains("--sub-langs"),
         "the caption matrix is a YouTube feature — no subtitle requests here:\n{calls}"
     );
+    // No metadata probe off YouTube: the generic path is ONE invocation end to end. Asserted as a
+    // count rather than "no --print", because the download argv legitimately carries
+    // `--print-to-file` — which is precisely how the name record avoids costing a second request.
+    assert_eq!(
+        invocations(&calls).len(),
+        1,
+        "the generic path downloads in one invocation:\n{calls}"
+    );
     assert!(
-        !calls.contains("--print"),
-        "no metadata probe: the generic path downloads in one invocation:\n{calls}"
+        !calls.contains("--print %("),
+        "and it must not run a standalone metadata print:\n{calls}"
     );
     assert!(
         !text(&out).contains("probing subtitles"),
         "and it must not announce a probe it never runs:\n{}",
         text(&out)
     );
+}
+
+/// The bug this machinery exists for, end to end. Off YouTube the "title" is routinely a whole
+/// post caption, and an unbounded one produced a file name of 648 bytes against a 255-byte limit —
+/// the download failed outright with `File name too long`. The template now bounds the title, so
+/// the download succeeds; because that throws text away, the run says so in red as it happens and
+/// keeps the full title in a record beside the media.
+#[test]
+fn a_title_too_long_for_the_filesystem_is_shortened_announced_and_recorded_in_full() {
+    let rig = Rig::new("long_name");
+    let title = overlong_title();
+    rig.names(&format!("genlong00001\t{title}"));
+
+    let out = rig.dl("ok", "https://media.example.com/v/3", &[]);
+    assert!(out.status.success(), "a long title must no longer fail the download:\n{}", text(&out));
+
+    // The template is what prevents the failure — bounded in BYTES, since that is what the
+    // filesystem counts and a caption's emoji cost four of them each.
+    assert!(
+        rig.calls().contains("%(title).150B [%(id)s].%(ext)s"),
+        "the generic template must bound the title:\n{}",
+        rig.calls()
+    );
+
+    // Announced in red, naming the video and the size of what was cut, so it is noticed during
+    // the run rather than discovered later in a file.
+    let all = text(&out);
+    assert!(all.contains("genlong00001"), "the notice names the video: {all}");
+    assert!(all.contains(&format!("{} bytes", title.len())), "and how long its title was: {all}");
+    assert!(all.contains("\u{1b}[1;31m"), "the notice must be red: {all:?}");
+
+    // And the full title survives in the record, keyed by the id, even though the file name
+    // cannot hold it.
+    let record = rig.modified("");
+    assert!(record.contains(&format!("genlong00001\t{title}")), "the title in full: {record}");
+    assert_eq!(record.lines().filter(|l| l.contains('\t')).count(), 1, "one entry: {record}");
+
+    // The scratch yt-dlp wrote is consumed, not left beside the media as a second bookkeeping file.
+    assert!(!rig.into.join(".dl_video_names").exists(), "the scratch must not survive the run");
+}
+
+/// The other half of the contract, and the one that keeps the record useful: a title that fits
+/// leaves no trace at all. A file recording every download would bury the handful of answers it
+/// exists to give.
+#[test]
+fn a_title_that_fits_is_downloaded_without_a_word_about_names() {
+    let rig = Rig::new("short_name");
+    rig.names("genfine00001\tA perfectly ordinary title");
+
+    let out = rig.dl("ok", "https://media.example.com/v/4", &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(rig.modified("").is_empty(), "nothing was cut, so nothing is recorded");
+    assert!(
+        !text(&out).contains("shortened"),
+        "and nothing is said about it: {}",
+        text(&out)
+    );
+    assert!(!rig.into.join(".dl_video_names").exists(), "the scratch is consumed regardless");
+}
+
+/// A collection's record belongs beside its media, not at the destination root — the same rule the
+/// download archive and the failure ledger follow, so everything this crate knows about one
+/// collection is in one folder.
+#[test]
+fn a_collections_shortened_names_are_recorded_beside_its_own_media() {
+    let rig = Rig::new("long_name_playlist");
+    fs::write(
+        rig.stub.join("scan.txt"),
+        "1\tvidlong0001\tClip One\tStub List\n\
+         Stub List [PLstub]\n",
+    )
+    .unwrap();
+    fs::write(rig.stub.join("probe.txt"), "1\tvidlong0001\ten\t{\"en\": [{\"name\": \"English\"}]}\t{}\n")
+        .unwrap();
+    fs::write(rig.stub.join("archive_adds.txt"), "youtube vidlong0001\n").unwrap();
+    let title = overlong_title();
+    rig.names(&format!("vidlong0001\t{title}"));
+
+    let out = rig.dl("ok", "https://www.youtube.com/playlist?list=PLstub", &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let record = rig.modified("Stub List [PLstub]");
+    assert!(record.contains(&format!("vidlong0001\t{title}")), "recorded in the collection: {record}");
+    assert!(rig.modified("").is_empty(), "and not at the destination root: {}", rig.modified(""));
+}
+
+/// The safety net. With the title bounded, a name the filesystem still refuses means the length is
+/// coming from somewhere this crate does not shorten — so the diagnosis must say that instead of
+/// dumping the offending 650-byte path and calling it advice.
+#[test]
+fn a_name_the_filesystem_refuses_is_diagnosed_as_a_path_length_not_a_site_problem() {
+    let rig = Rig::new("nametoolong");
+    let out = rig.dl("nametoolong", "https://media.example.com/v/5", &[]);
+    assert!(!out.status.success(), "a refused name is a real failure:\n{}", text(&out));
+
+    let ledger = rig.ledger();
+    assert!(ledger.contains("255 bytes"), "names the limit it hit: {ledger}");
+    assert!(ledger.contains("--into"), "and where the length can come from: {ledger}");
+    assert!(ledger.contains("%(title).150B"), "showing what a bounded title looks like: {ledger}");
+    assert!(
+        !ledger.to_lowercase().contains("retry"),
+        "the same name is refused every time — never suggest a retry: {ledger}"
+    );
+    // It must not be mistaken for one of the site-side gates, whose advice is all about cookies.
+    assert!(!ledger.contains("cookie"), "a local failure needs no cookie advice: {ledger}");
+    // And it must not sweep regions: nothing about a geo-block is involved.
+    assert!(!rig.calls().contains("--xff"), "no geo rescue for a local failure:\n{}", rig.calls());
 }
 
 /// A look-alike path on somebody else's host must not be mistaken for a YouTube channel — the

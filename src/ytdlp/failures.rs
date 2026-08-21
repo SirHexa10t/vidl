@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::util::exec::capture_output;
-use super::{ARCHIVE_NAME, ytdlp_invocation};
+use super::{ARCHIVE_NAME, names, ytdlp_invocation};
 use super::scan::{archived_ids};
 use crate::util::stamp;
 
@@ -46,6 +46,9 @@ enum Failure {
     Sensitive,
     LoginRequired,
     Drm,
+    /// The filesystem refused the name, not the site. Local, and so the one failure here that no
+    /// cookie, region or retry can help with.
+    NameTooLong,
     Other,
 }
 
@@ -60,7 +63,12 @@ fn classify_failure(stderr: &str) -> Failure {
     // and we won't mislabel it).
     let s = stderr.to_lowercase();
     let has = |needle: &str| s.contains(needle);
-    if has("in your country") || has("from your location") || has("in your region") || has("geo restrict") || has("geo_restrict") {
+    // Checked first, and safely so: this is the OS talking, not an extractor, and its phrasing
+    // overlaps none of the gates below. `ENAMETOOLONG` is errno 36 on Linux but not everywhere,
+    // so the message text is the portable half of the match.
+    if has("file name too long") || has("filename too long") || has("errno 36") {
+        Failure::NameTooLong
+    } else if has("in your country") || has("from your location") || has("in your region") || has("geo restrict") || has("geo_restrict") {
         Failure::Geo
     } else if has("not a bot") || has("captcha") || has("unusual traffic") || has("solve js challenge") || has("challenge data") || has("verify you are human") || has("verify you're human") {
         Failure::BotWall
@@ -132,6 +140,7 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
         Failure::Sensitive => Some(dead(sensitive_content_line(label, had_cookies))),
         Failure::LoginRequired => Some(dead(login_required_line(label, had_cookies))),
         Failure::Drm => Some(dead(drm_line(label, had_cookies))),
+        Failure::NameTooLong => Some(dead(name_too_long_line(label))),
         Failure::Other => {
             let detail = stderr
                 .lines()
@@ -208,6 +217,25 @@ fn drm_line(label: &str, had_cookies: bool) -> String {
     } else {
         format!("{label} — DRM-protected formats only; cookies sometimes unlock non-DRM variants (on YouTube even a logged-out session works): dl --cookie-import <site>, then retry")
     }
+}
+
+/// The ledger line for a name the filesystem refused outright. Terminal, and it never suggests a
+/// retry: nothing about the site changed, and the same name will be refused every time.
+///
+/// The title inside every file name is already bounded ([`names::TITLE_BYTES`]), so by the time
+/// this fires the length is coming from somewhere this crate does not shorten — which is exactly
+/// what the line has to say, since "the name is too long" is not actionable on its own. The
+/// candidates, in the order they turn up: a long playlist or channel title expanding into a folder
+/// name, a long component in `--into`, or an `-o` template passed through after `--`.
+fn name_too_long_line(label: &str) -> String {
+    format!(
+        "{label} — the filesystem refused the file name: a path component exceeded {} bytes. The \
+         title inside each name is already bounded (`{}`), so the excess comes from somewhere this \
+         crate doesn't shorten — a playlist/channel folder name, a component of --into, or an -o \
+         passed after `--`. Shorten --into, or pass your own bounded template: \
+         `-- -o '{} [%(id)s].%(ext)s'`",
+        names::NAME_MAX, names::TITLE_FIELD, names::TITLE_FIELD,
+    )
 }
 
 /// Whether a ledger line refers to video `id` — via the bracketed `[id]` every writer now
@@ -352,10 +380,45 @@ mod tests {
         ] {
             assert_eq!(classify_failure(msg), Failure::LoginRequired, "{msg}");
         }
+        // A name the filesystem refused — the OS talking, not a site. The errno phrasing is what
+        // yt-dlp actually emits (verified against a real over-long name); the other two spellings
+        // cover the platforms where the number differs or the message is worded the other way.
+        for msg in [
+            "ERROR: unable to open for writing: [Errno 36] File name too long: '/dl/aaa… [1].mp4.part'",
+            "ERROR: [Errno 63] Filename too long",
+            "OSError: errno 36",
+        ] {
+            assert_eq!(classify_failure(msg), Failure::NameTooLong, "{msg}");
+        }
+        // And it must not swallow a gate that merely mentions a long something.
+        assert_eq!(
+            classify_failure("ERROR: This video is DRM protected and has a very long title"),
+            Failure::Drm,
+            "the name check must not shadow the gates"
+        );
         // A bare 403 stays Other on purpose — ambiguous (rate-limit vs. bot vs. transient), so we
         // don't mislabel it as a bot-wall.
         assert_eq!(classify_failure("ERROR: HTTP Error 403: Forbidden"), Failure::Other);
         assert_eq!(XFF_REGIONS.len(), 12, "a dozen regions, as specified");
+    }
+
+    #[test]
+    fn the_name_too_long_line_says_where_the_length_came_from_and_never_says_retry() {
+        // "The name is too long" is not actionable on its own, and by the time this fires the
+        // title is already bounded — so the line's whole job is to name the components this crate
+        // does NOT shorten, and to be honest that a retry cannot help.
+        let line = name_too_long_line("[dQw4w9WgXcQ]");
+        assert!(ledger_line_refers(&line, "dQw4w9WgXcQ"), "carries the scrub key");
+        assert!(!line.contains('\n'), "one line, so scrub_ledger can line-filter it");
+        assert!(line.contains(&names::NAME_MAX.to_string()), "names the limit it hit");
+        assert!(line.contains(names::TITLE_FIELD), "shows what a bounded title looks like");
+        for culprit in ["folder name", "--into", "-o"] {
+            assert!(line.contains(culprit), "must name {culprit} as a candidate: {line}");
+        }
+        assert!(
+            !line.to_lowercase().contains("retry") && !line.to_lowercase().contains("try again"),
+            "the same name will be refused every time — never suggest a retry: {line}"
+        );
     }
 
     #[test]

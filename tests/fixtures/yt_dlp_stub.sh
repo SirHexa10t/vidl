@@ -16,13 +16,15 @@
 #     geo_unless_xff_us  fail with a geo phrasing unless invoked with `--xff US`
 #     fail_once_then_ok  fail the first download call, succeed on any retry
 #     members|age|botwall|drm  fail with that gate's real phrasing
+#     nametoolong        fail the way the OS does when a path component won't fit
 #
 # Probe invocations (--print) always succeed: --flat-playlist replays scan.txt, a
 # --playlist-items probe replays probe.txt, and a lone-video probe prints video_probe.txt when
 # present (else a bare id/NA/NA/NA). A SUCCESSFUL download mimics the real yt-dlp's side effects:
 # it appends archive_adds.txt (if present) to the run's --download-archive (the collection
-# post-mortem reads it), and copies cookie_dump.txt (if present) to a `--cookies <file>` target
-# (the cookie-import readability check reads that).
+# post-mortem reads it), appends names_adds.txt (if present) to the run's --print-to-file target
+# (the shortened-name record reads that), and copies cookie_dump.txt (if present) to a
+# `--cookies <file>` target (the cookie-import readability check reads that).
 
 args=" $* "
 dir="${VIDL_STUB_DIR:?VIDL_STUB_DIR must point at the test scratch dir}"
@@ -65,14 +67,19 @@ if [[ "$args" == *" --print "* ]]; then
     exit 0
 fi
 
-# A download invocation. Locate the --download-archive and --cookies values so success can
-# reproduce the real yt-dlp's side effects on them.
+# A download invocation. Locate the --download-archive, --cookies and --print-to-file values so
+# success can reproduce the real yt-dlp's side effects on them. `--print-to-file` takes TWO
+# operands (TEMPLATE then FILE), so its target sits two positions along rather than one.
 archive=""
 cookies_out=""
+names_out=""
 prev=""
+prev2=""
 for arg in "$@"; do
     if [[ "$prev" == "--download-archive" ]]; then archive="$arg"; fi
     if [[ "$prev" == "--cookies" ]]; then cookies_out="$arg"; fi
+    if [[ "$prev2" == "--print-to-file" ]]; then names_out="$arg"; fi
+    prev2="$prev"
     prev="$arg"
 done
 succeed() {
@@ -81,6 +88,12 @@ succeed() {
     fi
     if [[ -n "$cookies_out" && -f "$dir/cookie_dump.txt" ]]; then
         printf '%s\n' "$(<"$dir/cookie_dump.txt")" > "$cookies_out"
+    fi
+    # What each downloaded entry was called, as the real yt-dlp appends it: one `<id>\t<title>`
+    # line per video, the title unbounded (the whole point — it is what the file name could not
+    # keep). The name record reads this back.
+    if [[ -n "$names_out" && -f "$dir/names_adds.txt" ]]; then
+        printf '%s\n' "$(<"$dir/names_adds.txt")" >> "$names_out"
     fi
     exit 0
 }
@@ -114,6 +127,11 @@ case "${VIDL_STUB_MODE:-ok}" in
         exit 1 ;;
     drm)
         echo "ERROR: [youtube] stubvid0000: This video is DRM protected" >&2
+        exit 1 ;;
+    nametoolong)
+        # The real thing, verbatim in shape: the OS refusing a path component, reported by yt-dlp
+        # against the in-progress `.part` name rather than the final one.
+        echo "ERROR: unable to open for writing: [Errno 36] File name too long: '/dl/aaaa [1].mp4.part'" >&2
         exit 1 ;;
     *)
         echo "yt-dlp stub: unknown VIDL_STUB_MODE '${VIDL_STUB_MODE}'" >&2

@@ -2,10 +2,13 @@
 //! yt-dlp process the crate runs: the shared base (`common`), the per-mode argv builders, the
 //! cookie/network flags, and the `run` wrapper with its 403 diagnosis.
 //!
-//! Its two children read what comes back: [`failures`] interprets a non-zero exit into advice
-//! and a ledger line, [`scan`] turns a playlist or channel-tab listing into entries to download.
+//! Its children read what comes back or decide what it is called: [`failures`] interprets a
+//! non-zero exit into advice and a ledger line, [`scan`] turns a playlist or channel-tab listing
+//! into entries to download, and [`names`] owns the output templates and the record of any title
+//! too long to fit in a file name.
 
 pub(crate) mod failures;
+pub(crate) mod names;
 pub(crate) mod scan;
 
 use std::ffi::OsString;
@@ -13,6 +16,7 @@ use std::path::Path;
 
 use crate::Env;
 use crate::util::exec::run_reporting_code;
+use names::{GENERIC_NAME, YT_NAME};
 
 /// Point yt-dlp at whatever an embedder bundled. It only ever searches `PATH` on its own, so a
 /// bundled ffmpeg or JS runtime is invisible without these — and an embedder that bundles neither
@@ -77,15 +81,6 @@ pub(crate) fn seeded(env: Env) -> Vec<OsString> {
     argv
 }
 
-/// The file name every YouTube mode shares: sortable upload date, title, and the video id that
-/// keeps any file traceable back to its source (ideas kept from the old dl_youtube.py).
-const YT_NAME: &str = "%(upload_date)s__%(title)s__%(id)s.%(ext)s";
-
-/// Output template for a generic (non-YouTube) single download: title + id, flat under the
-/// destination. Simpler than [`YT_NAME`] — a random site rarely carries a reliable upload date,
-/// and there's no collection to sort into. The `[id]` also gives [`scrub_ledger`] a key to match.
-const GENERIC_NAME: &str = "%(title)s [%(id)s].%(ext)s";
-
 /// The download-archive's file name, dropped inside whatever folder owns the collection. Named
 /// for the `dl` command, not YouTube — every platform's downloads log here now.
 pub(crate) const ARCHIVE_NAME: &str = ".dl_video_archive.txt";
@@ -95,8 +90,9 @@ pub(crate) const ARCHIVE_NAME: &str = ".dl_video_archive.txt";
 /// date/description and thumbnail embedded as tags and cover art (thumbnail converted to jpg —
 /// the one format the mkv cover-art convention reliably recognizes), mkv output, and a
 /// download-archive (at `archive_dir`) so interrupted or repeated runs resume instead of
-/// redoing. yt-dlp marks the archive only after post-processing finishes — verified by racing
-/// the archive file against the output directory.
+/// redoing, and each download's own name recorded beside it for [`names::note_shortened`].
+/// yt-dlp marks the archive only after post-processing finishes — verified by racing the archive
+/// file against the output directory.
 ///
 /// mkv beats webm as the merge container even though both box the same codecs at the same
 /// quality: mkv accepts any codec yt-dlp picks (h264 fallbacks included) and embeds the
@@ -131,6 +127,10 @@ pub(crate) fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsSt
         .map(OsString::from),
     );
     argv.push(archive_dir.join(ARCHIVE_NAME).into_os_string());
+    // Every download names itself beside the archive, so the run can tell whether the output
+    // template had to cut a title short — see [`names`]. It rides the download invocation and
+    // costs no extra request.
+    argv.extend(names::record_flags(archive_dir));
     argv.extend(bundle_flags());
     argv.extend(cookie_args(env));
     if env.audio {
@@ -301,6 +301,7 @@ mod tests {
             "--merge-output-format", "mkv",
             "--ignore-errors",
             "--download-archive", "/dl/.dl_video_archive.txt",
+            "--print-to-file", "/dl/.dl_video_names",
             "--cookies", "/c.txt",
         ] {
             assert!(text.iter().any(|arg| arg == expected), "missing {expected}: {text:?}");
@@ -316,6 +317,9 @@ mod tests {
         ] {
             assert!(!bare.iter().any(|arg| arg == absent), "{absent} leaked in");
         }
+        // The name record is unconditional, though: every download must be able to say what it
+        // was called, whatever else the run asked for.
+        assert!(bare.iter().any(|arg| arg == "--print-to-file"), "the name record is not optional");
         // Thumbnails are a late opt-in pass now, never inline in the download argv.
         assert!(!text.iter().any(|a| a == "--embed-thumbnail"), "thumbnail must not be inline");
     }
@@ -355,7 +359,11 @@ mod tests {
             assert!(!text.contains(&absent.to_string()), "{absent} leaked into the generic path");
         }
         let out = text.iter().position(|a| a == "--output").expect("has --output");
-        assert_eq!(text[out + 1], "/dl/%(title)s [%(id)s].%(ext)s", "flat generic name under `into`");
+        assert_eq!(
+            text[out + 1],
+            "/dl/%(title).150B [%(id)s].%(ext)s",
+            "flat generic name under `into`, with the title bounded so it can't overrun NAME_MAX"
+        );
         // Quality knob still applies; the URL lands last; `-- --yes-playlist` follows our
         // --no-playlist so a user can override the single-video default.
         assert!(text.contains(&"res:720".to_string()));

@@ -48,6 +48,13 @@ text is written into metadata tags instead.
 they'd add, and deliberately ignore the download archive, so pointing them at an existing library
 patches it in place rather than re-downloading it.
 
+**Names that fit.** Many sites put a whole post caption in the video's title, which is how a
+"title" of several hundred characters reaches a filesystem that refuses any path component over
+255 bytes — and the download fails outright. The title inside each filename is bounded to 150
+bytes, measured in bytes because that is what the limit counts. When that cuts one short the run
+says so, in red, and writes the title in full to `.dl_video_modified` beside the media, so nothing
+the filename can no longer carry is actually lost.
+
 **Failure diagnosis.** A non-zero yt-dlp exit is read for what actually went wrong — geo-block,
 age gate, login wall, bot wall, DRM — and answered with the specific lever that helps, if one
 exists. A geo-blocked video on a site that honours it triggers a region sweep; one enforced by IP
@@ -101,6 +108,11 @@ vidl::tools::install(vidl::tools::Tools {
   failure handling, but no structure.
 - **Videos download one at a time.** That costs an extra metadata request each, and buys the
   per-video subtitle selection a single batch invocation cannot express.
+- **Folder names aren't bounded.** The title inside a *filename* is capped so it can't overrun the
+  255-byte path component limit; a playlist or channel title expanding into a *folder* name isn't.
+  Collection titles are far shorter than post captions in practice, and bounding them means
+  keeping two independently-computed spellings of the same folder in exact agreement — the scan
+  that decides where the archive goes, and the output template that decides where the videos go.
 - **No PO-token provider.** yt-dlp's strongest answer to bot-walling isn't wired up; the failure
   advice says so when it's what you'd need.
 - **Linux-shaped.** Developed and tested there. Nothing is deliberately platform-specific beyond
