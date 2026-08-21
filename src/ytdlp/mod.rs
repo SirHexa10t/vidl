@@ -16,7 +16,6 @@ use std::path::Path;
 
 use crate::Env;
 use crate::util::exec::run_reporting_code;
-use names::{GENERIC_NAME, YT_NAME};
 
 /// Point yt-dlp at whatever an embedder bundled. It only ever searches `PATH` on its own, so a
 /// bundled ffmpeg or JS runtime is invisible without these — and an embedder that bundles neither
@@ -89,10 +88,11 @@ pub(crate) const ARCHIVE_NAME: &str = ".dl_video_archive.txt";
 /// video's requested subtitles fetched-and-embedded (sidecars cleaned up), its title/uploader/
 /// date/description and thumbnail embedded as tags and cover art (thumbnail converted to jpg —
 /// the one format the mkv cover-art convention reliably recognizes), mkv output, and a
-/// download-archive (at `archive_dir`) so interrupted or repeated runs resume instead of
-/// redoing, and each download's own name recorded beside it for [`names::note_shortened`].
-/// yt-dlp marks the archive only after post-processing finishes — verified by racing the archive
-/// file against the output directory.
+/// download-archive (at `archive_dir`) so interrupted or repeated runs resume instead of redoing,
+/// and each download's own account of itself recorded beside it — the id, the path it landed at and
+/// its full title, which [`names`] reads back either to rename the file (off YouTube) or to record
+/// a title its name could not keep. yt-dlp marks the archive only after post-processing finishes —
+/// verified by racing the archive file against the output directory.
 ///
 /// mkv beats webm as the merge container even though both box the same codecs at the same
 /// quality: mkv accepts any codec yt-dlp picks (h264 fallbacks included) and embeds the
@@ -174,26 +174,32 @@ pub(crate) fn launch(argv: Vec<OsString>) -> i32 {
     code
 }
 
-/// A lone video, named [`YT_NAME`] directly under the destination (which also holds the
+/// A lone video, named [`names::yt_name`] directly under the destination (which also holds the
 /// archive). `--no-playlist` pins the meaning even when the link happens to carry a `list=`
 /// (the `--single` case).
 pub(crate) fn video_argv(url: &str, into: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
     let mut argv = common(into, env, langs);
     argv.extend(["--no-playlist", "--output"].map(OsString::from));
-    argv.push(into.join(YT_NAME).into_os_string());
+    argv.push(into.join(names::yt_name(names::limit())).into_os_string());
     argv.extend(env.extra.iter().map(OsString::from));
     argv.push(url.into());
     argv
 }
 
 /// A generic single download: [`common`] with no subtitle list (off YouTube there's no caption
-/// matrix to resolve), flat under `into` via [`GENERIC_NAME`]. `--no-playlist` keeps a page that
-/// happens to expose a playlist to the one video asked for — override with `-- --yes-playlist`,
-/// since `extra` is appended last and wins.
+/// matrix to resolve), flat under `into`. `--no-playlist` keeps a page that happens to expose a
+/// playlist to the one video asked for — override with `-- --yes-playlist`, since `extra` is
+/// appended last and wins.
+///
+/// Named [`names::temp_name`] — the id alone — and renamed afterwards by
+/// [`names::rename_downloaded`]. Off YouTube neither the title nor the id has a length anybody
+/// promised, and a template has to be handed to yt-dlp before either is known; downloading to a
+/// name that cannot overrun and putting the real one on after means the title gets everything the
+/// filesystem allows instead of what a template had to guess it might need.
 pub(crate) fn generic_argv(url: &str, into: &Path, env: Env) -> Vec<OsString> {
     let mut argv = common(into, env, &[]);
     argv.extend(["--no-playlist", "--output"].map(OsString::from));
-    argv.push(into.join(GENERIC_NAME).into_os_string());
+    argv.push(into.join(names::temp_name()).into_os_string());
     argv.extend(env.extra.iter().map(OsString::from));
     argv.push(url.into());
     argv
@@ -216,8 +222,11 @@ pub(crate) fn playlist_argv(
     }
     argv.push("--output".into());
     argv.push(
-        into.join(format!("%(playlist_title)s[%(playlist_id)s]/%(playlist_index)03d__{YT_NAME}"))
-            .into_os_string(),
+        into.join(format!(
+            "%(playlist_title)s[%(playlist_id)s]/{}",
+            names::yt_collection_name(names::limit())
+        ))
+        .into_os_string(),
     );
     argv.extend(env.extra.iter().map(OsString::from));
     argv.push(url.into());
@@ -241,7 +250,11 @@ pub(crate) fn channel_tab_argv(
     argv.extend([OsString::from("--playlist-items"), item.into()]);
     argv.push("--output".into());
     argv.push(
-        into.join(format!("%(uploader)s[%(channel_id)s]/{tab}/{YT_NAME}")).into_os_string(),
+        into.join(format!(
+            "%(uploader)s[%(channel_id)s]/{tab}/{}",
+            names::yt_name(names::limit())
+        ))
+        .into_os_string(),
     );
     argv.extend(env.extra.iter().map(OsString::from));
     argv.push(tab_url.into());
@@ -359,11 +372,11 @@ mod tests {
             assert!(!text.contains(&absent.to_string()), "{absent} leaked into the generic path");
         }
         let out = text.iter().position(|a| a == "--output").expect("has --output");
-        assert_eq!(
-            text[out + 1],
-            "/dl/%(title).150B [%(id)s].%(ext)s",
-            "flat generic name under `into`, with the title bounded so it can't overrun NAME_MAX"
-        );
+        // Flat under `into`, and named by the id alone — a name that cannot overrun whatever the
+        // site calls the video. `names::rename_downloaded` puts the title on afterwards, when its
+        // length and the extension are both known instead of guessed at.
+        assert_eq!(text[out + 1], format!("/dl/{}", names::temp_name()));
+        assert!(!text[out + 1].contains("%(title)"), "the title has no business in a temp name");
         // Quality knob still applies; the URL lands last; `-- --yes-playlist` follows our
         // --no-playlist so a user can override the single-video default.
         assert!(text.contains(&"res:720".to_string()));
@@ -447,7 +460,7 @@ mod tests {
         let langs = en_keys();
 
         let video = video_argv("https://youtu.be/x", Path::new("/dl"), Env::default(), &langs);
-        assert_eq!(template(&video), format!("/dl/{YT_NAME}"));
+        assert_eq!(template(&video), format!("/dl/{}", names::yt_name(names::limit())));
         assert_eq!(last(&video), "https://youtu.be/x", "the url comes last");
 
         // A playlist entry: files under the playlist folder, the archive inside it, and the

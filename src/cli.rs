@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
+use crate::ytdlp::names;
 use crate::{Env, Link, download_channel, download_generic, download_playlist, download_video, taglist};
 
 /// Every option the `vidl` command line accepts. Mirrors [`Env`] one-for-one, plus the two
@@ -60,6 +61,11 @@ pub struct Args {
     /// the download archive) is for patching previously-downloaded videos on a re-run
     #[arg(long)]
     pub subtitles: bool,
+    /// Longest file name the destination accepts, in bytes. Measured from the destination when
+    /// left out, which is right for every mainstream filesystem (255); set it for one that takes
+    /// less than it reports — an encrypted-filename mount, say, where 143 is typical
+    #[arg(long, value_name = "BYTES")]
+    pub name_max: Option<usize>,
     /// Print the notable yt-dlp flags (usable after `--`), then yt-dlp's full option list
     #[arg(short = 't', long)]
     pub taglist: bool,
@@ -102,6 +108,22 @@ pub fn run(args: Args) -> i32 {
     if let Err(err) = std::fs::create_dir_all(&args.into) {
         eprintln!("vidl: cannot create {}: {err}", args.into.display());
         return 1;
+    }
+    // Settle the file-name limit ONCE, here, before any output template is built: the caller's
+    // number if they gave one, else measured from the destination we just made sure exists. Every
+    // download in this run reads it back from that single answer, so a playlist of 400 videos
+    // measures nothing 400 times.
+    let limit = match args.name_max {
+        Some(bytes) => bytes,
+        None => names::probe_limit(&args.into),
+    };
+    names::install_limit(limit);
+    if names::limit() != names::DEFAULT_NAME_MAX {
+        println!(
+            "file names here are limited to {} bytes (not {}) — titles are cut to fit",
+            names::limit(),
+            names::DEFAULT_NAME_MAX
+        );
     }
     let env = args.env();
     match crate::classify(&url, args.single) {

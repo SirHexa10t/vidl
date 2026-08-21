@@ -27,7 +27,9 @@ Rust dependencies are just two: `clap` (the CLI) and `lofty` (in-place audio tag
 
 ```
 cargo build --release      # target/release/vidl
-cargo test                 # hermetic: no network, no yt-dlp needed
+cargo test                 # hermetic: no network. A yt-dlp on PATH adds a few offline
+                           # checks of what it does with an output template; without one
+                           # those skip with a visible SKIPPED line
 ./TEST.sh                  # the above plus the live network tests
 ```
 
@@ -50,10 +52,31 @@ patches it in place rather than re-downloading it.
 
 **Names that fit.** Many sites put a whole post caption in the video's title, which is how a
 "title" of several hundred characters reaches a filesystem that refuses any path component over
-255 bytes — and the download fails outright. The title inside each filename is bounded to 150
-bytes, measured in bytes because that is what the limit counts. When that cuts one short the run
-says so, in red, and writes the title in full to `.dl_video_modified` beside the media, so nothing
-the filename can no longer carry is actually lost.
+255 bytes — and the download fails outright. The two halves of the crate solve that differently,
+because they know different things when the name has to be decided.
+
+On YouTube the fields are predictable — an id is always 11 bytes, format ids are three characters
+— so the title is bounded inside the output template and yt-dlp does the naming. That keeps the
+`__<id>.` marker the thumbnail and subtitle patch passes locate files by. The budget is derived,
+not picked: whatever the limit has left once the separators, the id, the extension and yt-dlp's
+in-progress suffixes are reserved, which comes to 187 bytes of title.
+
+Off YouTube nothing is predictable — the title is a caption and yt-dlp builds the id out of the
+URL — so instead of guessing, the download goes to a name that cannot overrun (the id alone) and
+the real name is put on afterwards, when the title, id and extension are all known and the
+in-progress suffixes are gone. Nothing is reserved against ignorance, so the title gets **232 bytes
+here against the 151 a bounded template had to settle for**, and a name too long to write stops
+being possible rather than merely survivable. A rename that can't happen leaves the file called by
+its id — a poor name, not a lost download.
+
+The limit itself is measured from the destination once per run by trying to create a file there —
+one probe in the common case. `--name-max <bytes>` overrides it for a mount that accepts less than
+it reports (encrypted-filename mounts typically cap near 143).
+
+Whenever a title still doesn't fit, the run says so in red and writes it in full to
+`.dl_video_modified` beside the media, so nothing the filename can no longer carry is lost. And on
+the YouTube path, where a budget is still a prediction, a name the filesystem refuses anyway earns
+one retry at half the title — an uglier name instead of a lost download.
 
 **Failure diagnosis.** A non-zero yt-dlp exit is read for what actually went wrong — geo-block,
 age gate, login wall, bot wall, DRM — and answered with the specific lever that helps, if one

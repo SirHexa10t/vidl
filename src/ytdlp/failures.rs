@@ -140,7 +140,22 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
         Failure::Sensitive => Some(dead(sensitive_content_line(label, had_cookies))),
         Failure::LoginRequired => Some(dead(login_required_line(label, had_cookies))),
         Failure::Drm => Some(dead(drm_line(label, had_cookies))),
-        Failure::NameTooLong => Some(dead(name_too_long_line(label))),
+        // The OS refused the name, not the site the video — so a plain retry is pointless, but a
+        // *shorter* name is a different request. One attempt at half the title budget: a name only
+        // a little too long comes through, and the file lands with an uglier name instead of not
+        // landing at all. Nothing about the download changes but the `--output` template.
+        Failure::NameTooLong => {
+            let mut tried_shorter = false;
+            if let Some(shorter) = names::halve_title_bound(&base) {
+                println!("{label}: the file name was refused — retrying with a shorter one");
+                tried_shorter = true;
+                if matches!(capture_ytdlp(shorter), Some((true, _, _))) {
+                    println!("{label}: succeeded with a shortened name");
+                    return None;
+                }
+            }
+            Some(dead(name_too_long_line(label, tried_shorter)))
+        }
         Failure::Other => {
             let detail = stderr
                 .lines()
@@ -227,14 +242,19 @@ fn drm_line(label: &str, had_cookies: bool) -> String {
 /// what the line has to say, since "the name is too long" is not actionable on its own. The
 /// candidates, in the order they turn up: a long playlist or channel title expanding into a folder
 /// name, a long component in `--into`, or an `-o` template passed through after `--`.
-fn name_too_long_line(label: &str) -> String {
+fn name_too_long_line(label: &str, tried_shorter: bool) -> String {
+    let limit = names::limit();
+    // Only claim the shorter attempt when there was a bound to shrink. The generic path downloads
+    // to a name that cannot overrun in the first place, so a refusal there was never about the
+    // title and no retry was offered — saying otherwise would send the reader after the wrong
+    // thing entirely.
+    let already = if tried_shorter { " even at a halved title" } else { "" };
     format!(
-        "{label} — the filesystem refused the file name: a path component exceeded {} bytes. The \
-         title inside each name is already bounded (`{}`), so the excess comes from somewhere this \
-         crate doesn't shorten — a playlist/channel folder name, a component of --into, or an -o \
-         passed after `--`. Shorten --into, or pass your own bounded template: \
-         `-- -o '{} [%(id)s].%(ext)s'`",
-        names::NAME_MAX, names::TITLE_FIELD, names::TITLE_FIELD,
+        "{label} — the filesystem refused the file name{already}, so a path component is \
+         overrunning the {limit}-byte limit in force on something this crate doesn't shorten: a \
+         playlist/channel folder name, or a component of --into. If the destination's real limit \
+         is below {limit}, pass --name-max <bytes>; otherwise shorten --into, or name the files \
+         yourself with a bounded field (`-- -o '%(title).<bytes>B__%(id)s.%(ext)s'`)"
     )
 }
 
@@ -404,17 +424,24 @@ mod tests {
 
     #[test]
     fn the_name_too_long_line_says_where_the_length_came_from_and_never_says_retry() {
-        // "The name is too long" is not actionable on its own, and by the time this fires the
-        // title is already bounded — so the line's whole job is to name the components this crate
-        // does NOT shorten, and to be honest that a retry cannot help.
-        let line = name_too_long_line("[dQw4w9WgXcQ]");
+        // By the time this fires, both free-text fields are bounded AND the halved-title retry has
+        // already failed — so the line's whole job is to name what this crate does NOT shorten,
+        // and to be honest that trying again unchanged cannot help.
+        let line = name_too_long_line("[dQw4w9WgXcQ]", true);
         assert!(ledger_line_refers(&line, "dQw4w9WgXcQ"), "carries the scrub key");
         assert!(!line.contains('\n'), "one line, so scrub_ledger can line-filter it");
-        assert!(line.contains(&names::NAME_MAX.to_string()), "names the limit it hit");
-        assert!(line.contains(names::TITLE_FIELD), "shows what a bounded title looks like");
+        assert!(line.contains(&names::limit().to_string()), "names the limit in force");
+        assert!(line.contains("halved"), "says the shorter-name retry was already tried");
+        assert!(line.contains("--name-max"), "points at the flag for a smaller real limit");
         for culprit in ["folder name", "--into", "-o"] {
             assert!(line.contains(culprit), "must name {culprit} as a candidate: {line}");
         }
+        // And where no bound existed to shrink — the generic path, which is named by its id — the
+        // line must not claim a shorter attempt was made, or it sends the reader after the title
+        // when the length was never coming from there.
+        let untried = name_too_long_line("[dQw4w9WgXcQ]", false);
+        assert!(!untried.contains("halved"), "no bound, no claim of one: {untried}");
+        assert!(untried.contains("--name-max"), "the real levers are still named: {untried}");
         assert!(
             !line.to_lowercase().contains("retry") && !line.to_lowercase().contains("try again"),
             "the same name will be refused every time — never suggest a retry: {line}"

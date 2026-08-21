@@ -84,18 +84,36 @@ impl Rig {
         fs::read_to_string(self.into.join(sub).join(".dl_video_modified")).unwrap_or_default()
     }
 
-    /// Script what each successful download reports itself as having been called: one
-    /// `<id>\t<title>` line per video, exactly as yt-dlp's `--print-to-file` writes it.
-    fn names(&self, lines: &str) {
-        fs::write(self.stub.join("names_adds.txt"), lines).unwrap();
+    /// Script one successful download's own account of itself: the id, the file it landed at
+    /// (named relative to the destination), and the title in full — exactly the three fields
+    /// yt-dlp's `--print-to-file after_move:` writes. The stub creates that file too.
+    fn names(&self, id: &str, file: &str, title: &str) {
+        let line = format!("{id}\t{}\t{title}", self.into.join(file).display());
+        fs::write(self.stub.join("names_adds.txt"), line).unwrap();
+    }
+
+    /// The names of everything sitting in the destination root, bookkeeping dotfiles aside.
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&self.into)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| !name.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 }
 
-/// A title longer than the templates' byte budget, built rather than pasted so the test reads as
-/// the boundary it is testing.
+/// A title longer than any of the naming strategies can keep, built rather than pasted so the test
+/// reads as the boundary it is testing. It has to clear the roomiest of them — the generic path's
+/// rename, which seats a title in everything the filesystem allows bar the id and extension.
 fn overlong_title() -> String {
-    let title = format!("A caption that keeps going {}", "and going ".repeat(20));
-    assert!(title.len() > 150, "the fixture must actually exceed the budget");
+    let title = format!("A caption that keeps going {}", "and going ".repeat(40));
+    assert!(title.len() > 300, "the fixture must exceed every strategy's room");
     title
 }
 
@@ -114,6 +132,16 @@ fn text(out: &Output) -> String {
 /// `--print-to-file`, which is how a run learns the name each file was given.
 fn downloads(calls: &str) -> Vec<&str> {
     calls.lines().filter(|line| line.contains("--output")).collect()
+}
+
+/// The `--output` template of each download invocation. Read as its own value rather than by
+/// searching the whole line: the record format legitimately mentions `%(title)s`, so a line-wide
+/// match cannot tell a naming template from the bookkeeping riding beside it.
+fn output_templates(calls: &str) -> Vec<String> {
+    downloads(calls)
+        .iter()
+        .filter_map(|line| line.split_once("--output ")?.1.split(' ').next().map(str::to_string))
+        .collect()
 }
 
 /// Every non-empty invocation in a run, for the paths whose contract is a specific *number* of them.
@@ -446,9 +474,15 @@ fn a_non_youtube_url_takes_the_flat_generic_path_not_the_youtube_one() {
     let calls = rig.calls();
 
     assert!(calls.contains("--no-playlist"), "the generic path pins one video:\n{calls}");
+    // Off YouTube the download goes to a name that cannot overrun — the id alone — and the real
+    // name is put on afterwards, once the title and extension are known rather than guessed.
+    let templates = output_templates(&calls);
+    assert_eq!(templates.len(), 1, "one download, one template: {templates:?}");
+    assert!(templates[0].contains("%(id)."), "named by its id: {}", templates[0]);
     assert!(
-        calls.contains("%(title).150B [%(id)s].%(ext)s"),
-        "flat generic naming, not the YouTube date/title/id template:\n{calls}"
+        !templates[0].contains("%(title)"),
+        "and not by a title whose length nothing has measured yet: {}",
+        templates[0]
     );
     assert!(
         !calls.contains("%(upload_date)s"),
@@ -479,35 +513,37 @@ fn a_non_youtube_url_takes_the_flat_generic_path_not_the_youtube_one() {
 
 /// The bug this machinery exists for, end to end. Off YouTube the "title" is routinely a whole
 /// post caption, and an unbounded one produced a file name of 648 bytes against a 255-byte limit —
-/// the download failed outright with `File name too long`. The template now bounds the title, so
-/// the download succeeds; because that throws text away, the run says so in red as it happens and
-/// keeps the full title in a record beside the media.
+/// the download failed outright with `File name too long`. Now the download goes to a name that
+/// cannot overrun and the real one is put on afterwards, so it succeeds; a caption that long still
+/// won't fit, so the run says so in red and keeps the title in full beside the media.
 #[test]
-fn a_title_too_long_for_the_filesystem_is_shortened_announced_and_recorded_in_full() {
+fn a_title_too_long_for_the_filesystem_is_cut_on_rename_announced_and_recorded_in_full() {
     let rig = Rig::new("long_name");
     let title = overlong_title();
-    rig.names(&format!("genlong00001\t{title}"));
+    rig.names("genlong00001", "genlong00001.mp4", &title);
 
     let out = rig.dl("ok", "https://media.example.com/v/3", &[]);
     assert!(out.status.success(), "a long title must no longer fail the download:\n{}", text(&out));
 
-    // The template is what prevents the failure — bounded in BYTES, since that is what the
-    // filesystem counts and a caption's emoji cost four of them each.
-    assert!(
-        rig.calls().contains("%(title).150B [%(id)s].%(ext)s"),
-        "the generic template must bound the title:\n{}",
-        rig.calls()
-    );
+    // Downloaded under its id, then renamed to carry as much of the title as fits.
+    let files = rig.files();
+    assert_eq!(files.len(), 1, "one file, renamed in place: {files:?}");
+    let name = &files[0];
+    assert!(name.starts_with("A caption that keeps going"), "the title leads the name: {name}");
+    assert!(name.ends_with(" [genlong00001].mp4"), "and the id closes it: {name}");
+    assert!(name.len() <= 255, "{} bytes overruns the limit: {name}", name.len());
 
-    // Announced in red, naming the video and the size of what was cut, so it is noticed during
-    // the run rather than discovered later in a file.
+    // The whole point of renaming instead of bounding a template: by now the id and extension are
+    // known and yt-dlp's working suffixes are gone, so the title gets nearly the entire component
+    // rather than what a template had to reserve against every unknown.
+    let kept = name.len() - " [genlong00001].mp4".len();
+    assert!(kept > 200, "the rename should seat ~236 bytes of title, kept only {kept}");
+
+    // Announced in red as it happens, and the full title survives in the record.
     let all = text(&out);
     assert!(all.contains("genlong00001"), "the notice names the video: {all}");
     assert!(all.contains(&format!("{} bytes", title.len())), "and how long its title was: {all}");
     assert!(all.contains("\u{1b}[1;31m"), "the notice must be red: {all:?}");
-
-    // And the full title survives in the record, keyed by the id, even though the file name
-    // cannot hold it.
     let record = rig.modified("");
     assert!(record.contains(&format!("genlong00001\t{title}")), "the title in full: {record}");
     assert_eq!(record.lines().filter(|l| l.contains('\t')).count(), 1, "one entry: {record}");
@@ -522,10 +558,15 @@ fn a_title_too_long_for_the_filesystem_is_shortened_announced_and_recorded_in_fu
 #[test]
 fn a_title_that_fits_is_downloaded_without_a_word_about_names() {
     let rig = Rig::new("short_name");
-    rig.names("genfine00001\tA perfectly ordinary title");
+    rig.names("genfine00001", "genfine00001.mp4", "A perfectly ordinary title");
 
     let out = rig.dl("ok", "https://media.example.com/v/4", &[]);
     assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        rig.files(),
+        ["A perfectly ordinary title [genfine00001].mp4"],
+        "a title that fits is seated whole"
+    );
     assert!(rig.modified("").is_empty(), "nothing was cut, so nothing is recorded");
     assert!(
         !text(&out).contains("shortened"),
@@ -551,7 +592,7 @@ fn a_collections_shortened_names_are_recorded_beside_its_own_media() {
         .unwrap();
     fs::write(rig.stub.join("archive_adds.txt"), "youtube vidlong0001\n").unwrap();
     let title = overlong_title();
-    rig.names(&format!("vidlong0001\t{title}"));
+    rig.names("vidlong0001", "Stub List [PLstub]/1.mkv", &title);
 
     let out = rig.dl("ok", "https://www.youtube.com/playlist?list=PLstub", &[]);
     assert!(out.status.success(), "{}", text(&out));
@@ -570,9 +611,19 @@ fn a_name_the_filesystem_refuses_is_diagnosed_as_a_path_length_not_a_site_proble
     assert!(!out.status.success(), "a refused name is a real failure:\n{}", text(&out));
 
     let ledger = rig.ledger();
-    assert!(ledger.contains("255 bytes"), "names the limit it hit: {ledger}");
+    assert!(ledger.contains("255-byte"), "names the limit in force: {ledger}");
     assert!(ledger.contains("--into"), "and where the length can come from: {ledger}");
-    assert!(ledger.contains("%(title).150B"), "showing what a bounded title looks like: {ledger}");
+    assert!(ledger.contains("--name-max"), "and the flag for a smaller real limit: {ledger}");
+    assert!(ledger.contains("%(title)."), "showing what a bounded title looks like: {ledger}");
+    // No shorter attempt is offered here, and the line must not pretend one was: off YouTube the
+    // download is already named by its id, so a refusal was never about the title and shrinking
+    // one would send the reader after the wrong thing.
+    assert!(
+        !text(&out).contains("retrying with a shorter one"),
+        "there is no title bound to shrink on this path:\n{}",
+        text(&out)
+    );
+    assert!(!ledger.contains("halved"), "so the advice must not claim one was tried: {ledger}");
     assert!(
         !ledger.to_lowercase().contains("retry"),
         "the same name is refused every time — never suggest a retry: {ledger}"
@@ -581,6 +632,69 @@ fn a_name_the_filesystem_refuses_is_diagnosed_as_a_path_length_not_a_site_proble
     assert!(!ledger.contains("cookie"), "a local failure needs no cookie advice: {ledger}");
     // And it must not sweep regions: nothing about a geo-block is involved.
     assert!(!rig.calls().contains("--xff"), "no geo rescue for a local failure:\n{}", rig.calls());
+}
+
+/// The title bound each download invocation asked for, in order — the number inside
+/// `%(title).<n>B`. What the retry logic changes, so it is what a test on that logic reads.
+fn title_bounds(calls: &str) -> Vec<usize> {
+    downloads(calls)
+        .iter()
+        .filter_map(|line| {
+            let rest = line.split_once("%(title).")?.1;
+            rest.split_once('B')?.0.parse().ok()
+        })
+        .collect()
+}
+
+/// The recoverable half of a refused name. The budget cannot defend against every compounding
+/// worst case — a format id longer than reserved, heavy sanitizer widening, an unusual mount — so
+/// when the filesystem does refuse a name, one shorter attempt turns a lost download into a file
+/// with an uglier name. That is worth far more than a wider default budget.
+#[test]
+fn a_refused_name_earns_one_shorter_attempt_and_the_download_lands() {
+    let rig = Rig::new("nametoolong_retry");
+    let out = rig.dl("nametoolong_unless_shorter", YT_VIDEO, &[]);
+    assert!(out.status.success(), "the shorter name must rescue the download:\n{}", text(&out));
+
+    let all = text(&out);
+    assert!(all.contains("retrying with a shorter one"), "the attempt is announced: {all}");
+    assert!(all.contains("succeeded with a shortened name"), "and so is the rescue: {all}");
+    assert!(rig.ledger().is_empty(), "a rescued download must not be ledgered: {}", rig.ledger());
+
+    // The retry must actually have asked for less. The stub refuses on the argv alone, so the
+    // plain diagnostic re-run of the unchanged name was refused too — nothing but a genuinely
+    // shorter template could have got through.
+    let bounds = title_bounds(&rig.calls());
+    assert!(bounds.len() >= 3, "first attempt, plain re-run, then the shorter one: {bounds:?}");
+    assert_eq!(bounds[0], bounds[1], "the diagnostic re-run repeats the name verbatim");
+    assert_eq!(*bounds.last().unwrap(), bounds[0] / 2, "and the rescue halves it: {bounds:?}");
+}
+
+/// `--name-max` exists for a destination that accepts less than it reports — an encrypted-filename
+/// mount, typically. It has to reach the *budget*, not just be accepted as a flag, or it does
+/// nothing: a smaller limit must produce a smaller title bound in the template yt-dlp is handed.
+#[test]
+fn a_smaller_name_max_shrinks_the_title_bound_it_asks_yt_dlp_for() {
+    let wide = Rig::new("namemax_default");
+    wide.dl("ok", YT_VIDEO, &[]);
+    let wide_bound = *title_bounds(&wide.calls()).first().expect("a bounded template");
+
+    let narrow = Rig::new("namemax_143");
+    let out = narrow.dl("ok", YT_VIDEO, &["--name-max", "143"]);
+    let narrow_bound = *title_bounds(&narrow.calls()).first().expect("a bounded template");
+
+    assert!(
+        narrow_bound < wide_bound,
+        "--name-max 143 must tighten the title bound, not sit beside it ({narrow_bound} vs {wide_bound})"
+    );
+    // And the difference is exactly the difference in limits: the budget is derived from it, so
+    // every byte taken off the limit comes off the title.
+    assert_eq!(wide_bound - narrow_bound, 255 - 143, "the budget must track the limit byte for byte");
+    assert!(
+        text(&out).contains("limited to 143 bytes"),
+        "a non-default limit is worth saying out loud: {}",
+        text(&out)
+    );
 }
 
 /// A look-alike path on somebody else's host must not be mistaken for a YouTube channel — the

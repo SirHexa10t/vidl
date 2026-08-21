@@ -2,7 +2,9 @@
 # TEST.sh — run ALL of vidl's tests, including the live ones `cargo test` skips.
 #
 # Three categories, cheapest first:
-#   1. offline        unit + integration (a scripted yt-dlp stand-in on PATH) — hermetic, fast
+#   1. offline        unit + integration (a scripted yt-dlp stand-in on PATH) — network-free and
+#                     fast. A few of these ask a REAL yt-dlp what it does with an output template,
+#                     still without a network; they skip-with-notice when none is installed.
 #   2. live-quick     real YouTube downloads of a tiny public video, no cookies
 #   3. live-extended  real YouTube plus, for one test, a signed-in session you supply — either a
 #                     browser store (tests/cookies/browser.spec + store/) or a Netscape jar

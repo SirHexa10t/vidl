@@ -237,7 +237,7 @@ pub fn download_video(url: &str, into: &Path, env: Env) -> i32 {
     // Beside the ledger scrub, and for the same reason: the end of a pass is where this crate
     // reconciles what it knows against what is actually on disk. Late enough to include a name
     // from a download that only came through on the diagnostic retry.
-    names::note_shortened(into);
+    names::note_shortened(into, names::yt_title_budget(names::limit()));
     scrub_ledger(into);
     code
 }
@@ -275,9 +275,14 @@ pub fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
             Some(line) => write_ledger(into, &[line]),
         }
     }
-    // The path this matters most on: off YouTube the "title" is often a whole post caption, and
-    // an unbounded one is what made the file name unwritable in the first place.
-    names::note_shortened(into);
+    // The download went to a name that cannot overrun; the real one goes on now, when the title,
+    // the id and the extension are all known exactly. A caller who named their own `-o` after `--`
+    // gets the file where they asked for it, untouched.
+    if names::caller_named_output(env.extra) {
+        names::discard_names(into);
+    } else {
+        names::rename_downloaded(into, names::limit());
+    }
     scrub_ledger(into);
     code
 }
@@ -294,7 +299,7 @@ pub fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i32 {
         );
         let keys: Vec<String> = default_picks().iter().map(|pick| pick.key.clone()).collect();
         let code = launch(playlist_argv(url, into, into, env, &keys, None));
-        names::note_shortened(into);
+        names::note_shortened(into, names::yt_collection_title_budget(names::limit()));
         return code;
     };
     // The playlist's folder, spelled exactly as yt-dlp's template expansion will spell it.
@@ -335,7 +340,8 @@ pub fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i32 {
     let code = if pending.is_empty() {
         0
     } else {
-        download_pending(url, &pending, into, &home, env, |url, into, home, env, langs, items| {
+        let entry_bytes = names::yt_collection_title_budget(names::limit());
+        download_pending(url, &pending, into, &home, env, entry_bytes, |url, into, home, env, langs, items| {
             playlist_argv(url, into, home, env, langs, Some(items))
         })
     };
@@ -369,6 +375,9 @@ fn download_pending(
     into: &Path,
     home: &Path,
     env: Env,
+    // The title budget of whatever template `argv` builds — a playlist entry's carries an ordering
+    // prefix a channel tab's doesn't, so the two differ and only the caller knows which is in play.
+    title_bytes: usize,
     argv: impl Fn(&str, &Path, &Path, Env, &[String], &str) -> Vec<OsString>,
 ) -> i32 {
     println!("probing subtitles of {} entries…", pending.len());
@@ -410,7 +419,7 @@ fn download_pending(
         }
         // Per group rather than once at the end: a long collection should report a shortened name
         // as the file lands, not in a batch after every group has run.
-        names::note_shortened(home);
+        names::note_shortened(home, title_bytes);
         for plan in &group {
             finish_media(home, &plan.id, &plan.picks, env);
         }
@@ -443,7 +452,7 @@ fn download_pending(
     }
     // The post-mortem re-ran the entries that failed inside a group; any that came through on the
     // retry named itself just now, after the per-group pass above had already run.
-    names::note_shortened(home);
+    names::note_shortened(home, title_bytes);
     scrub_ledger(home);
     write_ledger(home, &ledger);
     worst
@@ -505,7 +514,7 @@ pub fn download_channel(root: &str, into: &Path, env: Env) -> i32 {
         let tab_code = if pending.is_empty() {
             0
         } else {
-            download_pending(&tab_url, &pending, into, &home, env, |url, into, home, env, langs, items| {
+            download_pending(&tab_url, &pending, into, &home, env, names::yt_title_budget(names::limit()), |url, into, home, env, langs, items| {
                 channel_tab_argv(url, tab, into, home, env, langs, items)
             })
         };
@@ -583,6 +592,22 @@ pub(crate) mod testutil {
         });
         if !works {
             eprintln!("SKIPPED {test}: no usable ffmpeg/ffprobe available");
+        }
+        works
+    }
+
+    /// Skip-with-notice: `true` when a real yt-dlp is runnable. For the handful of tests that must
+    /// check what yt-dlp *itself* does with an argument this crate builds — an output template's
+    /// truncation semantics, say — which no stand-in can answer. Those tests still need no
+    /// network: yt-dlp expands a template against a local info dict.
+    pub(crate) fn ytdlp_or_skip(test: &str) -> bool {
+        let (program, args) = crate::ytdlp::ytdlp_invocation(vec![OsString::from("--version")]);
+        let works = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !works {
+            eprintln!("SKIPPED {test}: no usable yt-dlp available");
         }
         works
     }

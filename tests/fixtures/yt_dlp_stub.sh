@@ -17,6 +17,7 @@
 #     fail_once_then_ok  fail the first download call, succeed on any retry
 #     members|age|botwall|drm  fail with that gate's real phrasing
 #     nametoolong        fail the way the OS does when a path component won't fit
+#     nametoolong_unless_shorter  refuse until the --output template asks for a shorter title
 #
 # Probe invocations (--print) always succeed: --flat-playlist replays scan.txt, a
 # --playlist-items probe replays probe.txt, and a lone-video probe prints video_probe.txt when
@@ -89,11 +90,15 @@ succeed() {
     if [[ -n "$cookies_out" && -f "$dir/cookie_dump.txt" ]]; then
         printf '%s\n' "$(<"$dir/cookie_dump.txt")" > "$cookies_out"
     fi
-    # What each downloaded entry was called, as the real yt-dlp appends it: one `<id>\t<title>`
-    # line per video, the title unbounded (the whole point — it is what the file name could not
-    # keep). The name record reads this back.
+    # What each downloaded entry was called, as the real yt-dlp's `--print-to-file after_move:`
+    # appends it: one `<id>\t<filepath>\t<title>` line per video, the title unbounded (the whole
+    # point — it is what a file name could not keep). Each recorded file is also *created*, since
+    # a real download leaves one behind and the generic path's rename pass has to find it there.
     if [[ -n "$names_out" && -f "$dir/names_adds.txt" ]]; then
         printf '%s\n' "$(<"$dir/names_adds.txt")" >> "$names_out"
+        while IFS=$'\t' read -r _id path _title || [[ -n "$_id" ]]; do
+            if [[ -n "$path" ]]; then : > "$path"; fi
+        done < "$dir/names_adds.txt"
     fi
     exit 0
 }
@@ -131,6 +136,16 @@ case "${VIDL_STUB_MODE:-ok}" in
     nametoolong)
         # The real thing, verbatim in shape: the OS refusing a path component, reported by yt-dlp
         # against the in-progress `.part` name rather than the final one.
+        echo "ERROR: unable to open for writing: [Errno 36] File name too long: '/dl/aaaa [1].mp4.part'" >&2
+        exit 1 ;;
+    nametoolong_unless_shorter)
+        # Refuse while the template still asks for a long title; accept once it asks for little
+        # enough. Keyed on the ARGV, not on a call counter, because that is what a real filesystem
+        # does — the plain diagnostic re-run of an unchanged name is refused exactly as the first
+        # attempt was, and only a genuinely shorter template gets through.
+        bound="${args#*%(title).}"
+        bound="${bound%%B*}"
+        if [[ "$bound" =~ ^[0-9]+$ ]] && (( bound <= 100 )); then succeed; fi
         echo "ERROR: unable to open for writing: [Errno 36] File name too long: '/dl/aaaa [1].mp4.part'" >&2
         exit 1 ;;
     *)
