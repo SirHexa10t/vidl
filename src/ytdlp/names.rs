@@ -356,10 +356,13 @@ pub(crate) fn final_name(prefix: &str, title: &str, id: &str, ext: &str, limit: 
     }
 }
 
-/// The ordering prefix a collected video's name carries: its position on the page, zero-padded —
-/// the same `NNN__` shape a YouTube playlist entry gets. Empty for a lone download.
-pub(crate) fn position_prefix(position: Option<usize>) -> String {
-    position.map(|at| format!("{at:03}__")).unwrap_or_default()
+/// The ordering prefix a collected video's name carries, from a label the caller worked out — a
+/// position, an episode number, or an `S6E01`-style index. Empty for a lone download.
+///
+/// The label is the caller's business because only it knows what the ordering *means*; this only
+/// fixes the separator, which matches the `NNN__` shape a YouTube playlist entry gets.
+pub(crate) fn position_prefix(label: Option<&str>) -> String {
+    label.map(|label| format!("{label}__")).unwrap_or_default()
 }
 
 /// `text` as a single path component, made safe and cut to `bytes`.
@@ -613,9 +616,9 @@ fn take_scratch(dir: &Path) -> Option<Vec<Recorded>> {
 ///
 /// A file that can't be renamed keeps its temporary name. That is a poor name, not a lost
 /// download — the graceful degradation the bounded-template approach could not offer.
-pub(crate) fn rename_downloaded(dir: &Path, limit: usize, position: Option<usize>) {
+pub(crate) fn rename_downloaded(dir: &Path, limit: usize, label: Option<&str>) {
     let Some(records) = take_scratch(dir) else { return };
-    let prefix = position_prefix(position);
+    let prefix = position_prefix(label);
     let mut cut = Vec::new();
     for record in records {
         let from = Path::new(&record.path);
@@ -828,12 +831,14 @@ mod tests {
 
         // A collected video leads with its position on the page, and pays for it out of the title
         // — the prefix shares the component, so it cannot be free.
-        let numbered = final_name(&position_prefix(Some(7)), &title, "vid1", "mkv", DEFAULT_NAME_MAX);
+        let numbered =
+            final_name(&position_prefix(Some("007")), &title, "vid1", "mkv", DEFAULT_NAME_MAX);
         assert!(numbered.starts_with("007__"), "zero-padded, sortable: {numbered}");
         assert!(numbered.len() <= DEFAULT_NAME_MAX);
         let plain = final_name("", &title, "vid1", "mkv", DEFAULT_NAME_MAX);
         assert_eq!(plain.len(), numbered.len(), "the prefix comes out of the title, not the limit");
         assert_eq!(position_prefix(None), "", "a lone download is not numbered");
+        assert_eq!(position_prefix(Some("S6E01")), "S6E01__", "a label need not be a number");
     }
 
     #[test]

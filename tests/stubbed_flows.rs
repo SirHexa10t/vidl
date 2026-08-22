@@ -746,8 +746,12 @@ fn a_page_hiding_a_collection_is_walked_into_a_folder_in_page_order() {
     let all = text(&out);
     assert!(all.contains("lists 3 Kaltura videos"), "the count is announced: {all}");
     // These entries carry their own numbers, so those are what the files are numbered by rather
-    // than the order the page happened to list them in.
-    assert!(all.contains("by the numbers in their own names"), "the numbering is announced: {all}");
+    // than the order the page happened to list them in. The run says which it used, and these
+    // names carry no episode *word*, so the fallback is what should be announced.
+    assert!(
+        all.contains("numbering them by the last number in each name"),
+        "the numbering, and how it was arrived at, is announced: {all}"
+    );
 
     // A folder of its own, named for what the entries have in common plus the page's identifier —
     // the shape a playlist gets. The entries here are titled "Entry 0/1/2", so the opening they

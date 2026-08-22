@@ -39,6 +39,7 @@
 pub mod tools;
 
 mod cli;
+mod keywords;
 mod media;
 mod page;
 mod util;

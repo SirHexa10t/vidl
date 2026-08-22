@@ -105,10 +105,11 @@ pub(crate) fn download_collection(url: &str, into: &Path, env: Env) -> Option<i3
     // The collection's own numbering, when it has one. Page order is only the fallback.
     let numbering = naming::sequence(&scan.page, &siblings);
     match &numbering {
-        Some(_) => println!("numbering them by the numbers in their own names"),
+        Some(found) => println!("numbering them by {}", found.source),
         None => println!("their names carry no sequence — numbering them in page order"),
     }
-    Some(download_each(&siblings, platform, &scan.page, &home, env, numbering.as_deref()))
+    let labels = numbering.as_ref().map(|found| found.prefixes.as_slice());
+    Some(download_each(&siblings, platform, &scan.page, &home, env, labels))
 }
 
 /// Download each sibling in the order the page lists them, numbered by `numbering` where the
@@ -125,19 +126,23 @@ fn download_each(
     page: &str,
     home: &Path,
     env: Env,
-    numbering: Option<&[usize]>,
+    numbering: Option<&[String]>,
 ) -> i32 {
     let limit = names::limit();
     let (mut worst, mut done) = (0, 0usize);
     let mut unreachable = Vec::new();
+    // Page order is the fallback, padded to the width the set needs so it sorts as text too.
+    let width = naming::digits(siblings.len());
     for (index, id) in siblings.iter().enumerate() {
-        // The video's own number where the collection has one, else its place on the page.
-        let position = numbering.and_then(|seq| seq.get(index).copied()).unwrap_or(index + 1);
+        // The video's own index where the collection has one, else its place on the page.
+        let label = numbering
+            .and_then(|labels| labels.get(index).cloned())
+            .unwrap_or_else(|| format!("{:0width$}", index + 1));
         let Some(target) = (platform.address)(id, page) else {
             unreachable.push(id.clone());
             continue;
         };
-        println!("=== {position}/{} {id} ===", siblings.len());
+        println!("=== {}/{} {id} ===", index + 1, siblings.len());
         let mut code = launch(generic_argv(&target, home, env));
         if code != 0 {
             match diagnose_failure(generic_argv(&target, home, env), &target, GeoRescue::XffSweep) {
@@ -152,7 +157,7 @@ fn download_each(
         }
         // Per sibling, because the position belongs to this one file and the next download would
         // overwrite the record it was named from.
-        names::rename_downloaded(home, limit, Some(position));
+        names::rename_downloaded(home, limit, Some(&label));
     }
     if !unreachable.is_empty() {
         eprintln!(
