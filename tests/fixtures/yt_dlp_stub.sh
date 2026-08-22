@@ -20,6 +20,10 @@
 #     members|age|botwall|drm  fail with that gate's real phrasing
 #     nametoolong        fail the way the OS does when a path component won't fit
 #     nametoolong_unless_shorter  refuse until the --output template asks for a shorter title
+#     range_refused_unless_restarted  refuse a resume the way a server does when the leftover
+#                     .part is already as long as the remote file, until told --no-continue
+#     range_refused_then_other  the same refusal, but the restart hits an unrelated error —
+#                     observed for real when ffmpeg was missing
 #
 # Probe invocations (--print) always succeed: --flat-playlist replays scan.txt, a
 # --playlist-items probe replays probe.txt, and a lone-video probe prints video_probe.txt when
@@ -179,6 +183,28 @@ case "${VIDL_STUB_MODE:-ok}" in
         bound="${bound%%B*}"
         if [[ "$bound" =~ ^[0-9]+$ ]] && (( bound <= 100 )); then succeed; fi
         echo "ERROR: unable to open for writing: [Errno 36] File name too long: '/dl/aaaa [1].mp4.part'" >&2
+        exit 1 ;;
+    range_refused_unless_restarted)
+        # A leftover `.part` at least as long as the remote file: the resume asks for a byte range
+        # that cannot exist, and asks for exactly the same one every time. Keyed on the ARGV rather
+        # than a call counter, like nametoolong_unless_shorter and for the same reason — a plain
+        # re-run of an unchanged command is refused just as the first attempt was, and only a
+        # request that stops trying to resume gets through. The resume offset goes to STDOUT, where
+        # the real yt-dlp reports it.
+        if [[ "$args" == *" --no-continue "* ]]; then succeed; fi
+        echo "[download] Resuming download at byte 749233884"
+        echo "ERROR: unable to download video data: HTTP Error 416: Requested Range Not Satisfiable" >&2
+        exit 1 ;;
+    range_refused_then_other)
+        # The restart gets past the stale file and the download then dies of something unrelated.
+        # Seen in a real run: the resume was refused, starting over fetched the whole file, and the
+        # postprocessor failed because ffmpeg was not installed.
+        if [[ "$args" == *" --no-continue "* ]]; then
+            echo "ERROR: ffmpeg not found. Please install or provide the path using --ffmpeg-location" >&2
+            exit 1
+        fi
+        echo "[download] Resuming download at byte 749233884"
+        echo "ERROR: unable to download video data: HTTP Error 416: Requested Range Not Satisfiable" >&2
         exit 1 ;;
     *)
         echo "yt-dlp stub: unknown VIDL_STUB_MODE '${VIDL_STUB_MODE}'" >&2

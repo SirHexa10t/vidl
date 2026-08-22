@@ -190,7 +190,7 @@ pub(crate) fn video_argv(url: &str, into: &Path, env: Env, langs: &[String]) -> 
 /// playlist to the one video asked for — override with `-- --yes-playlist`, since `extra` is
 /// appended last and wins.
 ///
-/// Named [`names::temp_name`] — the id alone — and renamed afterwards by
+/// Named [`names::temp_name`] — the id and the chosen format — and renamed afterwards by
 /// [`names::rename_downloaded`]. Off YouTube neither the title nor the id has a length anybody
 /// promised, and a template has to be handed to yt-dlp before either is known; downloading to a
 /// name that cannot overrun and putting the real one on after means the title gets everything the

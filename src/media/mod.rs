@@ -15,6 +15,7 @@ use crate::Env;
 use crate::ytdlp::{seeded, ytdlp_invocation};
 use crate::ytdlp::scan::{ScanEntry};
 use self::subtitles::{Pick, batch_probe};
+use crate::util::size;
 use crate::util::style;
 
 /// Rename the embedded titles of auto-generated subtitle tracks. YouTube's own names read like
@@ -47,6 +48,25 @@ pub(crate) fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) 
     };
     let retitle = auto_title_stamps(&listing, picks);
     if retitle.is_empty() {
+        return;
+    }
+    // Checked here, not beside the lookup above, so the count in the notice is true: by this point
+    // the file really does hold tracks that would have been renamed.
+    //
+    // Without this the pass ran on anything the lookup found, and the remux below is hardcoded to
+    // write Matroska (`stamping.mkv`) before renaming its result back over the original — so a
+    // `.webm` or `.mp4` either failed outright, when its subtitle codec would not `-c copy` into
+    // Matroska, or survived as a file whose contents no longer matched its extension.
+    if !is_mkv(&file) {
+        eprintln!(
+            "{}",
+            style::problematic(&format!(
+                "vidl: subtitle track names embed into mkv only — {} auto-generated name(s) in {} \
+                 left as YouTube wrote them",
+                retitle.len(),
+                file.display()
+            ))
+        );
         return;
     }
     let ffmpeg = crate::tools::ffmpeg();
@@ -394,7 +414,7 @@ pub(crate) fn embed_thumbnails(dir: &Path, ids: &[String]) {
             // A cover embeds as an mkv attachment ([`attach_thumbnail`] muxes into the mkv
             // container) — renaming that over an audio/webm file would swap its container out
             // from under it, corrupting it. Skip anything that isn't an mkv, and say so.
-            Some(file) if file.extension().and_then(|ext| ext.to_str()) != Some("mkv") => {
+            Some(file) if !is_mkv(&file) => {
                 println!("  [{id}]: {}", style::problematic("not an mkv — cover art embeds into video (mkv) only; skipping"));
             }
             Some(file) => match has_embedded_thumbnail(&file) {
@@ -551,8 +571,15 @@ pub(crate) fn embed_subtitles(into: &Path, id: &str, url: &str, expected: &[Pick
         println!("  [{id}]: {}", style::problematic("no file found — skipping"));
         return;
     };
-    if file.extension().and_then(|ext| ext.to_str()) != Some("mkv") {
-        println!("  [{id}]: {}", style::approved("audio — subtitles kept as tags; nothing to patch"));
+    if !is_mkv(&file) {
+        // Two different situations, and calling both "audio" told half the users a video had
+        // nothing to patch when in fact it could not be patched at all.
+        let why = if is_audio(&file) {
+            style::approved("audio — subtitles kept as tags; nothing to patch")
+        } else {
+            style::problematic("not an mkv — subtitle tracks embed into video (mkv) only; skipping")
+        };
+        println!("  [{id}]: {why}");
         return;
     }
     let Some((count, embedded)) = subtitle_streams(&file) else {
@@ -624,6 +651,130 @@ pub(crate) fn patch_collection_subtitles(url: &str, entries: &[&ScanEntry], home
 
 /// The downloaded file whose name carries `__<id>.` — the id rides in every output template
 /// precisely so files stay findable. A shallow recursive walk under `root`.
+/// The video containers a download can land in.
+///
+/// `.mkv` is the default merge target and `.webm` a documented override. `.mp4` earns its place
+/// off YouTube: a generic single-format download very often ends in it, and while it was missing
+/// from here every pass that locates a file by its id quietly skipped those.
+///
+/// Kept apart from [`AUDIO_EXTS`] because the difference is load-bearing — a pass that cannot use
+/// a container has to say whether that is because the file is audio (nothing was lost) or because
+/// it is a video this crate cannot mux into (something was).
+const VIDEO_EXTS: [&str; 3] = [".mp4", ".mkv", ".webm"];
+
+/// What an `--audio` run leaves instead of a video.
+const AUDIO_EXTS: [&str; 6] = [".opus", ".m4a", ".mp3", ".ogg", ".flac", ".wav"];
+
+/// Whether `name` ends in an extension one of this crate's downloads produces.
+fn is_media_name(name: &str) -> bool {
+    VIDEO_EXTS.iter().chain(&AUDIO_EXTS).any(|ext| name.ends_with(ext))
+}
+
+/// Whether `file` is an audio extraction rather than a video.
+fn is_audio(file: &Path) -> bool {
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    AUDIO_EXTS.iter().any(|ext| name.ends_with(ext))
+}
+
+/// Whether `file` is the one container the passes here can mux into.
+///
+/// mkv takes attachments (cover art) and subtitle streams of any codec; the alternatives a
+/// download can land in take neither, or not in a way `-c copy` can carry. All three muxing passes
+/// ask this and all three *decline* rather than convert: re-encoding a finished download to add a
+/// track name or a cover would cost far more than either is worth.
+fn is_mkv(file: &Path) -> bool {
+    file.extension().and_then(|ext| ext.to_str()) == Some("mkv")
+}
+
+/// Delete the `.part` files no run can ever finish, and say which ones went.
+///
+/// # Exactly what gets deleted
+///
+/// A file is removed only if **all three** hold:
+///
+/// 1. its name ends in `.part` — yt-dlp's in-progress suffix;
+/// 2. stripped of that suffix, it ends in an extension a download writes — so it is something we
+///    wrote, not another program's unrelated partial (a browser downloading `report.pdf` leaves
+///    `report.pdf.part`, and that must survive);
+/// 3. its name contains no `__`.
+///
+/// Nothing else in the tree is touched: no finished videos, no subtitle sidecars, no thumbnails,
+/// and no `.part` file that could still be resumed.
+///
+/// # Why the `__` rule makes it safe
+///
+/// Every `--output` template this crate hands yt-dlp puts `__` in the name — the id marker on
+/// YouTube, the position prefix in a collection, the id/format separator off YouTube. A part file
+/// without one therefore cannot belong to any download *this* version is able to resume: it was
+/// written before part files were keyed to their rendition, and the name yt-dlp would now look for
+/// is a different name, so the bytes are unreachable and will sit there forever.
+///
+/// That invariant is not assumed. `names::tests` asserts every template contains `__`, so if a
+/// future template ever drops it, a test fails rather than this sweep quietly eating live data.
+///
+/// One consequence is worth stating outright: a part file being written *right now*, by a
+/// concurrently running `vidl`, is never a candidate — its name contains `__` like every other
+/// current one. This cannot interrupt a download in progress.
+///
+/// # Why it also had to be a sweep
+///
+/// Cleaning up only what the current video needs would leave the rest untouched forever, because
+/// an interrupted collection leaves a leftover per entry and the entries that already succeeded
+/// are skipped on the next run. So it walks the whole destination once per run — the leftovers sit
+/// wherever the interrupted download was writing, which for a collection is a folder the next run
+/// may never enter.
+pub(crate) fn discard_stale_parts(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    let mut removed: Vec<(String, u64)> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !is_stale_part(&path) {
+                continue;
+            }
+            let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                // Reported by full path: these sit in nested collection folders, and a bare file
+                // name would not say which.
+                Ok(()) => removed.push((path.display().to_string(), size)),
+                Err(why) => eprintln!(
+                    "{}",
+                    style::problematic(&format!(
+                        "vidl: could not remove the unresumable {} ({why})",
+                        path.display()
+                    ))
+                ),
+            }
+        }
+    }
+    if removed.is_empty() {
+        return;
+    }
+    let freed: u64 = removed.iter().map(|(_, size)| size).sum();
+    println!(
+        "removed {} unfinishable partial download(s), freeing {} — left by a version whose \
+         partial files could not be told apart by rendition:",
+        removed.len(),
+        size::roughly(freed)
+    );
+    for (path, size) in removed {
+        println!("  {path} ({})", size::roughly(size));
+    }
+}
+
+/// Whether `path` is a partial download this crate can no longer finish — the three conditions
+/// listed on [`discard_stale_parts`], which is the only caller and where the reasoning lives.
+fn is_stale_part(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return false };
+    let Some(stem) = name.strip_suffix(".part") else { return false };
+    !name.contains("__") && is_media_name(stem)
+}
+
 pub(crate) fn find_by_id(root: &Path, id: &str) -> Option<PathBuf> {
     let marker = format!("__{id}.");
     let mut stack = vec![root.to_path_buf()];
@@ -634,10 +785,7 @@ pub(crate) fn find_by_id(root: &Path, id: &str) -> Option<PathBuf> {
                 stack.push(path);
             } else if path.file_name().is_some_and(|name| {
                 let name = name.to_string_lossy();
-                name.contains(&marker)
-                    && [".mkv", ".opus", ".m4a", ".mp3", ".ogg", ".flac", ".wav", ".webm"]
-                        .iter()
-                        .any(|ext| name.ends_with(ext))
+                name.contains(&marker) && is_media_name(&name)
             }) {
                 return Some(path);
             }
@@ -709,6 +857,83 @@ mod tests {
     }
 
     #[test]
+    fn a_download_is_classified_as_mkv_other_video_or_audio() {
+        // The three-way split the muxing passes report on: an mkv they can use, another video
+        // container they cannot (so something IS lost and it should read as a problem), and an
+        // audio extraction (where nothing was lost and it should not).
+        assert!(is_mkv(Path::new("Title__abcdefghijk.mkv")));
+        for video in ["Title__abcdefghijk.mp4", "Title__abcdefghijk.webm"] {
+            let path = Path::new(video);
+            assert!(!is_mkv(path), "{video}");
+            assert!(!is_audio(path), "{video} is a video — calling it audio was the bug here");
+        }
+        for audio in ["s__id.opus", "s__id.m4a", "s__id.mp3", "s__id.ogg", "s__id.flac", "s__id.wav"] {
+            let path = Path::new(audio);
+            assert!(!is_mkv(path), "{audio}");
+            assert!(is_audio(path), "{audio}");
+        }
+        // Every extension the lookup accepts has to land in exactly one bucket, or a pass could
+        // find a file it has no wording for.
+        for ext in VIDEO_EXTS.iter().chain(&AUDIO_EXTS) {
+            let name = format!("Title__abcdefghijk{ext}");
+            assert!(is_media_name(&name), "{name} must be findable");
+            assert_ne!(
+                is_audio(Path::new(&name)),
+                VIDEO_EXTS.contains(ext),
+                "{name} must be video or audio, not both and not neither"
+            );
+        }
+        assert!(!is_media_name("notes__abcdefghijk.txt"), "not something we download");
+    }
+
+    #[test]
+    fn discarding_stale_parts_takes_only_the_unfinishable_ones() {
+        let dir = scratch_dir("stale_parts");
+        std::fs::create_dir_all(dir.join("Season 6[2025881]")).unwrap();
+        let write = |rel: &str| {
+            std::fs::write(dir.join(rel), b"xxxx").unwrap();
+            dir.join(rel)
+        };
+        // Must GO: the old scheme, at the root and nested in a collection folder.
+        let old_root = write("1_niery1hs.mp4.part");
+        let old_nested = write("Season 6[2025881]/1_8jx8mama.mkv.part");
+        // Must STAY, each for its own reason.
+        let current = write("Season 6[2025881]/S6E01__1_aaaaaaaa.mp4.part"); // resumable
+        let youtube = write("20240101__Title__abcdefghijk.mkv.part"); // resumable
+        let browser = write("quarterly report.pdf.part"); // not ours at all
+        let finished = write("1_niery1hs.mp4"); // a finished download
+        let sidecar = write("1_niery1hs.en.vtt"); // not a partial
+
+        discard_stale_parts(&dir);
+
+        assert!(!old_root.exists(), "an old-scheme leftover must go");
+        assert!(!old_nested.exists(), "including inside a collection folder");
+        assert!(current.exists(), "a part the current scheme can resume must stay");
+        assert!(youtube.exists(), "the YouTube naming carries `__` too, and is resumable");
+        assert!(browser.exists(), "another program's partial is none of our business");
+        assert!(finished.exists(), "a finished download is not a partial");
+        assert!(sidecar.exists(), "a sidecar is not a partial");
+        // Idempotent: a second sweep finds nothing and touches nothing.
+        discard_stale_parts(&dir);
+        assert!(current.exists() && finished.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_part_is_judged_by_all_three_conditions() {
+        // The predicate on its own, so each condition is pinned independently of the walk.
+        let stale = |name: &str| is_stale_part(Path::new(name));
+        assert!(stale("1_niery1hs.mp4.part"), "the case this exists for");
+        assert!(stale("abc.mkv.part") && stale("abc.opus.part"), "any extension we write");
+        assert!(!stale("1_niery1hs.mp4"), "not a `.part` at all");
+        assert!(!stale("notes.txt.part"), "not an extension we write");
+        assert!(!stale("report.pdf.part"), "a browser's partial download");
+        assert!(!stale("S6E01__abc.mp4.part"), "a resumable current-scheme part");
+        assert!(!stale("a__b.mp4.part"), "`__` anywhere is enough to spare it");
+        assert!(!stale(".part"), "a bare suffix has no extension to match");
+    }
+
+    #[test]
     fn find_by_id_walks_nested_dirs_and_matches_media_extensions_only() {
         let dir = scratch_dir("findbyid");
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
@@ -718,6 +943,10 @@ mod tests {
         let found = find_by_id(&dir, "abcdefghijk").expect("nested mkv found");
         assert!(found.ends_with("a/b/20200101__Title__abcdefghijk.mkv"), "{found:?}");
         assert!(find_by_id(&dir, "qrstuvwxyz1").is_some(), "audio extensions match too");
+        // `.mp4` is what a generic single-format download lands as; while it was missing from the
+        // list, every pass that locates a file by its id silently skipped those.
+        std::fs::write(dir.join("clip__mp4vid00001.mp4"), b"x").unwrap();
+        assert!(find_by_id(&dir, "mp4vid00001").is_some(), "generic downloads land as .mp4");
         assert!(find_by_id(&dir, "zzzzzzzzzzz").is_none(), "an unknown id finds nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -279,12 +279,34 @@ const NAMES_SCRATCH: &str = ".dl_video_names";
 /// generic path downloads to a name it chose, and this is how it learns which file to rename.
 const RECORD_FORMAT: &str = "after_move:%(id)s\t%(filepath)s\t%(title)s";
 
-/// The name the generic path downloads *to*: the id alone, bounded, so it cannot overrun any
-/// limit whatever the site calls the video. The real name is put on afterwards by
+/// How much of a format id the temporary name keeps.
+///
+/// Generous: real ones are short (`mp4-468`, `616+140`, and the longest seen in the wild is
+/// Facebook's 18-character `1016219494584300v`). The bound is here because an unbounded field in a
+/// template is the mistake this module exists to have stopped making, not because anything is
+/// expected to reach it. Two renditions would have to agree on 32 bytes to collide.
+const FORMAT_ID_BYTES: usize = 32;
+
+/// The name the generic path downloads *to*: the id and the chosen format, bounded, so it cannot
+/// overrun any limit whatever the site calls the video. The real name is put on afterwards by
 /// [`rename_downloaded`], which by then knows the title, the id and the extension exactly and so
 /// needs none of the reserves a template handed to yt-dlp does.
+///
+/// # Why the format id is in here
+///
+/// yt-dlp downloads to `<this>.part` and resumes that file by byte offset if it is still there
+/// when the command runs again. It has no way to check that the bytes on disk came from the same
+/// rendition — so an interrupted download followed by a run that picks a *different* one appends
+/// the new rendition to the old one's bytes and reports success. Measured: a part file holding
+/// 10 MiB of a 640x360 rendition, resumed against 854x480, produced a file whose first 10 MiB
+/// came from one and whose remaining 108 MiB came from the other, with no error and the exact
+/// size of the larger. Naming the part after its rendition means a different one simply finds no
+/// part to resume, while the *same* one still resumes and still saves the bytes it should.
+///
+/// Merged downloads were always safe — yt-dlp gives each stream its own `.f<format_id>` temporary
+/// — so this closes the single-format case, which is the one the generic path usually takes.
 pub(crate) fn temp_name() -> String {
-    format!("%(id).{ID_BYTES}B.%(ext)s")
+    format!("%(id).{ID_BYTES}B__%(format_id).{FORMAT_ID_BYTES}B.%(ext)s")
 }
 
 /// The characters no mainstream filesystem takes in a name, and what they become.
@@ -695,6 +717,25 @@ mod tests {
     /// free of characters JSON would need escaped, so a serializer would be a dependency for
     /// nothing. `id` is mandatory — yt-dlp refuses an info dict without one outright, which is
     /// also why nothing downstream has to handle an absent id.
+    /// Like [`info_json`], but naming the chosen format — for the template that keys a temporary
+    /// file to its rendition. One file per format id, so two can sit in one scratch dir.
+    fn info_json_of_format(dir: &Path, id: &str, format_id: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("info-{format_id}.json"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"_type\":\"video\",\"id\":\"{id}\",\"title\":\"T\",\"ext\":\"mp4\",\
+                 \"format_id\":\"{format_id}\",\
+                 \"extractor\":\"generic\",\"extractor_key\":\"Generic\",\
+                 \"webpage_url\":\"https://example.test/v/1\",\
+                 \"formats\":[{{\"url\":\"https://example.test/a.mp4\",\"ext\":\"mp4\",\
+                 \"format_id\":\"{format_id}\"}}]}}"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
     fn info_json(dir: &Path, id: &str, title: &str) -> std::path::PathBuf {
         assert!(!title.contains(['"', '\\']), "this fixture writer does not escape JSON");
         let path = dir.join("info.json");
@@ -1167,6 +1208,68 @@ mod tests {
         let text = String::from_utf8(name).expect("a bounded name is still valid UTF-8");
         assert!(text.contains(&"T".repeat(BUDGET)), "the title should fill its budget: {text}");
         assert!(!text.contains(&"T".repeat(BUDGET + 1)), "and not exceed it: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_name_this_crate_downloads_to_contains_the_double_underscore() {
+        // Load-bearing, and not merely tidy: `media::discard_stale_parts` deletes `.part` files
+        // whose names lack `__`, on the grounds that no current template can produce one. If a
+        // template ever drops the separator, that sweep would start deleting live partial
+        // downloads — so the guarantee is asserted here rather than assumed there.
+        for template in [
+            temp_name(),
+            yt_name(DEFAULT_NAME_MAX),
+            yt_collection_name(DEFAULT_NAME_MAX),
+        ] {
+            assert!(
+                template.contains("__"),
+                "`{template}` has no `__`, which would make the stale-part sweep unsafe"
+            );
+        }
+    }
+
+    #[test]
+    fn the_temporary_name_is_keyed_to_the_rendition_and_bounds_every_field() {
+        let template = temp_name();
+        // Without this, one video's renditions share a `.part` file and resuming across them
+        // splices two encodings into one file that reports no error.
+        assert!(template.contains("%(format_id)"), "a part must belong to one rendition: {template}");
+        assert!(template.contains(&format!("%(id).{ID_BYTES}B")), "{template}");
+        assert!(
+            template.contains(&format!("%(format_id).{FORMAT_ID_BYTES}B")),
+            "an unbounded field is the mistake this module exists to prevent: {template}"
+        );
+        assert!(template.ends_with(".%(ext)s"), "the rename pass reads the extension: {template}");
+        // Both fields at their bound, plus the suffixes yt-dlp appends while downloading, still
+        // has to fit — a temporary name that cannot be created is worse than a long one.
+        let worst = ID_BYTES + "__".len() + FORMAT_ID_BYTES + ".mkv".len() + ".part-Frag1234".len();
+        assert!(worst <= DEFAULT_NAME_MAX, "{worst} bytes could overrun {DEFAULT_NAME_MAX}");
+    }
+
+    #[test]
+    fn real_ytdlp_gives_two_renditions_of_one_video_different_temporary_names() {
+        let test = "real_ytdlp_gives_two_renditions_of_one_video_different_temporary_names";
+        if !ytdlp_or_skip(test) {
+            return;
+        }
+        let dir = scratch_dir("names_rendition_tmpl");
+        // Same video, same id, different chosen format — expanded by the real yt-dlp, since the
+        // question is what IT will call the file it resumes.
+        let small = expanded(&info_json_of_format(&dir, "vid1", "mp4-468"), &temp_name());
+        let large = expanded(&info_json_of_format(&dir, "vid1", "mp4-670"), &temp_name());
+        assert_ne!(
+            small, large,
+            "two renditions sharing a name is exactly how a part file gets spliced: {}",
+            String::from_utf8_lossy(&small)
+        );
+        // And the shape the rest of the crate relies on survives: an extension to read, and the
+        // id still recoverable at the front.
+        for name in [&small, &large] {
+            let text = String::from_utf8_lossy(name);
+            assert!(text.ends_with(".mp4"), "the rename pass needs the extension: {text}");
+            assert!(text.starts_with("vid1__"), "the id still leads: {text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

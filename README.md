@@ -62,12 +62,26 @@ not picked: whatever the limit has left once the separators, the id, the extensi
 in-progress suffixes are reserved, which comes to 187 bytes of title.
 
 Off YouTube nothing is predictable — the title is a caption and yt-dlp builds the id out of the
-URL — so instead of guessing, the download goes to a name that cannot overrun (the id alone) and
-the real name is put on afterwards, when the title, id and extension are all known and the
-in-progress suffixes are gone. Nothing is reserved against ignorance, so the title gets **232 bytes
-here against the 151 a bounded template had to settle for**, and a name too long to write stops
-being possible rather than merely survivable. A rename that can't happen leaves the file called by
-its id — a poor name, not a lost download.
+URL — so instead of guessing, the download goes to a name that cannot overrun (the id and the
+chosen format) and the real name is put on afterwards, when the title, id and extension are all
+known and the in-progress suffixes are gone. Nothing is reserved against ignorance, so the title
+gets **232 bytes here against the 151 a bounded template had to settle for**, and a name too long
+to write stops being possible rather than merely survivable. A rename that can't happen leaves the
+file called by its id — a poor name, not a lost download.
+
+The format is in that temporary name for a reason that has nothing to do with length. yt-dlp
+resumes a leftover `.part` by byte offset and cannot tell whether those bytes came from the
+rendition now being asked for; naming the file after its rendition means a different one finds
+nothing to resume, while the same one still resumes. A resume the server refuses outright — which
+is what a `.part` as long as the finished file gets — is recognised and the file started over,
+saying how much will be fetched again before spending it.
+
+That leaves earlier versions' partial files stranded, so **each run deletes the ones nothing can
+finish** and prints every path it removed. The rule is narrow on purpose: a file goes only if it
+ends in `.part`, ends in a media extension underneath that, *and* has no `__` in its name. Every
+output template here contains `__` — a test enforces it — so nothing the current version could
+resume is ever a candidate, including a partial file another `vidl` is writing at that moment. A
+browser's `report.pdf.part` fails the extension test and is left alone.
 
 The limit itself is measured from the destination once per run by trying to create a file there —
 one probe in the common case. `--name-max <bytes>` overrides it for a mount that accepts less than

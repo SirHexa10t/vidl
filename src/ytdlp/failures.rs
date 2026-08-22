@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::util::exec::capture_output;
+use crate::util::size::roughly;
 use super::{ARCHIVE_NAME, names, ytdlp_invocation};
 use super::scan::{archived_ids};
 use crate::util::stamp;
@@ -49,6 +50,11 @@ enum Failure {
     /// The filesystem refused the name, not the site. Local, and so the one failure here that no
     /// cookie, region or retry can help with.
     NameTooLong,
+    /// A resume asked for bytes the server does not have. Caused by a leftover `.part` at least as
+    /// long as the remote file — the shape an interrupt leaves when it lands after the last byte
+    /// but before the rename. Local in origin like [`Failure::NameTooLong`], and likewise immune
+    /// to a plain retry: the same impossible range is asked for every time.
+    RangeRefused,
     Other,
 }
 
@@ -68,6 +74,12 @@ fn classify_failure(stderr: &str) -> Failure {
     // so the message text is the portable half of the match.
     if has("file name too long") || has("filename too long") || has("errno 36") {
         Failure::NameTooLong
+    // Also local in origin, and checked early for the same reason: a refused byte range says
+    // nothing about the site's willingness to serve, only that the leftover `.part` is too long
+    // for the range to exist. Matched on the phrase and on `error 416` rather than on a bare
+    // "416", which would happily match a video id or a title.
+    } else if has("range not satisfiable") || has("error 416") {
+        Failure::RangeRefused
     } else if has("in your country") || has("from your location") || has("in your region") || has("geo restrict") || has("geo_restrict") {
         Failure::Geo
     } else if has("not a bot") || has("captcha") || has("unusual traffic") || has("solve js challenge") || has("challenge data") || has("verify you are human") || has("verify you're human") {
@@ -85,6 +97,71 @@ fn classify_failure(stderr: &str) -> Failure {
     } else {
         Failure::Other
     }
+}
+
+/// The line yt-dlp meant as the cause — its first `ERROR`, or an admission that there wasn't one.
+fn error_line(stderr: &str) -> &str {
+    stderr.lines().find(|line| line.contains("ERROR")).unwrap_or("unknown error").trim()
+}
+
+/// The same download, told to start the file from the beginning instead of resuming it.
+///
+/// `None` when the argv already says so, which means starting over has already been tried and
+/// failed — there is no third thing to attempt, and re-running an identical command would only
+/// produce an identical failure.
+fn restarting(base: &[OsString]) -> Option<Vec<OsString>> {
+    if base.iter().any(|arg| arg == "--no-continue") {
+        return None;
+    }
+    let mut fresh = base.to_vec();
+    fresh.push("--no-continue".into());
+    Some(fresh)
+}
+
+/// The offset a refused resume was going to continue from, read back out of yt-dlp's own report of
+/// it (`[download] Resuming download at byte 749233884`).
+///
+/// Worth reading rather than measuring the `.part` on disk: this is the number the downloader
+/// actually acted on, and finding the file would mean reconstructing its name from the `--output`
+/// template — the same guess, made less reliably.
+fn resumed_at(output: &str) -> Option<u64> {
+    output
+        .split("Resuming download at byte ")
+        .nth(1)?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// What to record when starting over cleared the stale file and something else stopped the
+/// download anyway.
+///
+/// Two facts, both needed: the range refusal is why the run looked odd, and the second error is
+/// why it still failed. Naming only the first would send the user after a `.part` the restart has
+/// already consumed.
+fn restarted_into_line(label: &str, detail: &str) -> String {
+    format!(
+        "{label} — the partial file could not be resumed (the server refused the byte range), so it \
+         was started over; that got past the leftover file and then failed: {detail}"
+    )
+}
+
+/// What to record when a refused resume could not be rescued.
+///
+/// Names the `.part` file as the thing to remove, because that is the fix a person can apply and
+/// the one the crate could not: when even starting over fails, the leftover file is still sitting
+/// there and still poisoning every future run of this command.
+fn range_refused_line(label: &str, restarted: bool) -> String {
+    let tail = if restarted {
+        "starting it over did not help either — delete the leftover `.part` file beside the \
+         destination and run this again"
+    } else {
+        "the download was already told to start over, so the leftover `.part` file beside the \
+         destination is not the whole story — delete it and run this again to see the real error"
+    };
+    format!("{label} — a partial file could not be resumed (the server refused the byte range); {tail}")
 }
 
 /// The ledger line for a failure this crate cannot name — plus the one hint worth giving for the
@@ -124,7 +201,7 @@ pub(crate) fn capture_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String
 /// failure is also announced on stderr as it's decided, so the reason shows in the run's output —
 /// not only later in the ledger.
 pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoRescue) -> Option<String> {
-    let Some((ok, _, stderr)) = capture_ytdlp(base.clone()) else {
+    let Some((ok, stdout, stderr)) = capture_ytdlp(base.clone()) else {
         return Some(dead(format!("{label} — failed (could not even re-run yt-dlp)")));
     };
     if ok {
@@ -180,14 +257,40 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
             }
             Some(dead(name_too_long_line(label, tried_shorter)))
         }
-        Failure::Other => {
-            let detail = stderr
-                .lines()
-                .find(|line| line.contains("ERROR"))
-                .unwrap_or("unknown error")
-                .trim();
-            Some(dead(other_line(label, detail)))
+        // The resume asked the server for bytes past the end of what it has, so the request can
+        // never succeed however many times it is repeated — and yt-dlp's own recovery for this is
+        // unreachable (it reopens the connection to re-read the length, but the Range header rides
+        // along on the shared header dict, so the "retry without the range" is the same request).
+        // Starting the file over is the one thing that clears it. Targeted at THIS failure and no
+        // other: `--no-continue` everywhere would throw away every legitimate half-done resume.
+        Failure::RangeRefused => {
+            let mut restarted = false;
+            if let Some(fresh) = restarting(&base) {
+                // Say what it costs before spending it. The bytes are already on disk and about to
+                // be fetched a second time, which on a large file is worth a chance to interrupt.
+                let spend = resumed_at(&stdout)
+                    .or_else(|| resumed_at(&stderr))
+                    .map(|bytes| format!("; the {} already downloaded will be fetched again", roughly(bytes)))
+                    .unwrap_or_default();
+                println!("{label}: the partial file cannot be resumed — starting it over{spend}");
+                restarted = true;
+                match capture_ytdlp(fresh) {
+                    Some((true, _, _)) => {
+                        println!("{label}: succeeded after starting the file over");
+                        return None;
+                    }
+                    // The restart overwrote the stale file and then died of something else. Say so:
+                    // the advice below would send the user to delete a `.part` that is no longer
+                    // there, and blame the range for a failure that has nothing to do with it.
+                    Some((false, _, again)) if classify_failure(&again) != Failure::RangeRefused => {
+                        return Some(dead(restarted_into_line(label, error_line(&again))));
+                    }
+                    _ => {}
+                }
+            }
+            Some(dead(range_refused_line(label, restarted)))
         }
+        Failure::Other => Some(dead(other_line(label, error_line(&stderr)))),
     }
 }
 
@@ -444,6 +547,66 @@ mod tests {
         // don't mislabel it as a bot-wall.
         assert_eq!(classify_failure("ERROR: HTTP Error 403: Forbidden"), Failure::Other);
         assert_eq!(XFF_REGIONS.len(), 12, "a dozen regions, as specified");
+    }
+
+    #[test]
+    fn a_refused_byte_range_is_recognised_without_mistaking_a_416_in_a_name_for_one() {
+        // The real thing, as the server and yt-dlp phrase it between them.
+        assert_eq!(
+            classify_failure("ERROR: unable to download video data: HTTP Error 416: Requested Range Not Satisfiable"),
+            Failure::RangeRefused
+        );
+        // Either half stands alone: some servers send the phrase without the number in yt-dlp's
+        // wrapping, and some wrappings carry the number without the phrase.
+        assert_eq!(classify_failure("ERROR: HTTP Error 416: whatever"), Failure::RangeRefused);
+        assert_eq!(classify_failure("ERROR: requested range not satisfiable"), Failure::RangeRefused);
+        // And what must NOT match: a bare "416" anywhere in a name or id. This is why the needle is
+        // the phrase and `error 416`, not the digits.
+        for innocent in [
+            "ERROR: [generic] Room 416 Tour: Unable to download webpage",
+            "ERROR: unable to open for writing: '/dl/Flight 416.mp4.part'",
+        ] {
+            assert_eq!(classify_failure(innocent), Failure::Other, "{innocent}");
+        }
+    }
+
+    #[test]
+    fn the_resume_offset_is_read_from_the_downloaders_own_report_of_it() {
+        // Exactly as yt-dlp prints it, mid-stream among other lines.
+        let output = "[info] x: Downloading 1 format(s): mp4-3882\n                      [download] Resuming download at byte 749233884\n                      [download] Destination: x.mp4\n";
+        assert_eq!(resumed_at(output), Some(749_233_884));
+        // Trailing punctuation or an end-of-string must not swallow the digits.
+        assert_eq!(resumed_at("Resuming download at byte 12"), Some(12));
+        assert_eq!(resumed_at("Resuming download at byte 12, continuing"), Some(12));
+        // Nothing to read is not an error — the message just goes without the size.
+        assert_eq!(resumed_at("[download] Destination: x.mp4"), None);
+        assert_eq!(resumed_at("Resuming download at byte "), None);
+    }
+
+    #[test]
+    fn starting_over_is_offered_once_and_then_admitted_to_be_exhausted() {
+        let base: Vec<OsString> = ["-o", "x.mp4", "https://example.com/v"].iter().map(OsString::from).collect();
+        let fresh = restarting(&base).expect("a first restart is available");
+        assert_eq!(fresh.last().expect("an argument"), "--no-continue");
+        assert_eq!(fresh.len(), base.len() + 1, "nothing else is disturbed");
+        // Asked again on a command that already gave up resuming, there is nothing left to try —
+        // and re-running the identical argv would only fail identically.
+        assert!(restarting(&fresh).is_none(), "no second restart");
+    }
+
+    #[test]
+    fn an_unrescuable_refused_range_names_the_file_the_user_has_to_remove() {
+        // The crate cannot delete it — the name is yt-dlp's to choose and the bytes might be
+        // wanted — so the least it can do is say what is in the way.
+        let after_restart = range_refused_line("clip", true);
+        assert!(after_restart.contains("`.part`"), "the culprit is named: {after_restart}");
+        assert!(after_restart.contains("delete"), "and the action: {after_restart}");
+        assert!(after_restart.contains("did not help"), "honest that a restart was tried: {after_restart}");
+        // The other branch can only be reached by a caller that already passed --no-continue, and
+        // must not claim a restart was attempted here.
+        let never_tried = range_refused_line("clip", false);
+        assert!(!never_tried.contains("did not help"), "no invented attempt: {never_tried}");
+        assert!(never_tried.contains("delete"), "the action still stands: {never_tried}");
     }
 
     #[test]

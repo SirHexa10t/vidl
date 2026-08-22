@@ -228,12 +228,76 @@ fn a_finished_download_says_so_in_green() {
 }
 
 #[test]
+fn a_run_clears_unfinishable_leftovers_from_the_destination_before_downloading() {
+    // The litter an interrupted older run leaves behind: partial files named without a rendition,
+    // which the current naming can never resume and so would otherwise sit there forever.
+    let rig = Rig::new("stale_sweep");
+    let stale = rig.into.join("1_niery1hs.mp4.part");
+    let mine = rig.into.join("S6E01__1_aaaaaaaa.mp4.part");
+    let theirs = rig.into.join("quarterly report.pdf.part");
+    for path in [&stale, &mine, &theirs] {
+        fs::write(path, vec![b'x'; 4096]).unwrap();
+    }
+    let out = rig.dl("ok", YT_VIDEO, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(!stale.exists(), "the unfinishable leftover goes: {:?}", rig.files());
+    assert!(mine.exists(), "a resumable partial stays: {:?}", rig.files());
+    assert!(theirs.exists(), "another program's partial stays: {:?}", rig.files());
+    // Deleting a user's file silently would be indefensible — it has to be said, by full path and
+    // with what it recovered.
+    assert!(all.contains("unfinishable partial download"), "the sweep announces itself: {all}");
+    assert!(all.contains("1_niery1hs.mp4.part"), "and names what it removed: {all}");
+    assert!(all.contains("4.0 KiB"), "and what that recovered: {all}");
+}
+
+#[test]
 fn a_transient_failure_succeeds_on_the_diagnostic_retry() {
     let rig = Rig::new("retry");
     let out = rig.dl("fail_once_then_ok", YT_VIDEO, &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("succeeded on retry"), "{}", text(&out));
     assert!(rig.ledger().is_empty(), "a retried success must not be ledgered: {}", rig.ledger());
+}
+
+#[test]
+fn a_resume_the_server_refuses_restarts_the_file_instead_of_giving_up() {
+    // An interrupted download leaves a `.part`. If the interrupt landed after the last byte, that
+    // file is already as long as the remote one, so resuming asks for a range that cannot exist —
+    // and gets a 416 every single time, which is why re-running the command never cleared it.
+    let rig = Rig::new("range_refused");
+    let out = rig.dl("range_refused_unless_restarted", YT_VIDEO, &[]);
+    assert!(out.status.success(), "starting the file over rescues it: {}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("cannot be resumed — starting it over"), "the restart is announced: {all}");
+    // What it costs, in the units yt-dlp prints two lines above: 749233884 B = 714.5 MiB. Silently
+    // re-fetching that much would be worse than saying so.
+    assert!(all.contains("714.5 MiB already downloaded will be fetched again"), "the cost is stated: {all}");
+    assert!(all.contains("succeeded after starting the file over"), "and the outcome: {all}");
+    assert!(rig.ledger().is_empty(), "a rescued download must not be ledgered: {}", rig.ledger());
+    let calls = rig.calls();
+    assert_eq!(
+        calls.matches("--no-continue").count(),
+        1,
+        "only the restart carries it — resuming stays the default for genuinely partial files:\n{calls}"
+    );
+}
+
+#[test]
+fn a_restart_that_clears_the_part_and_then_fails_blames_the_real_error() {
+    // Found by running it for real: the resume was refused, starting over fetched the whole file,
+    // and the run still failed — because ffmpeg was missing. Telling the user to delete a `.part`
+    // the restart has already consumed would send them after the wrong thing entirely.
+    let rig = Rig::new("range_refused_then_other");
+    let out = rig.dl("range_refused_then_other", YT_VIDEO, &[]);
+    assert!(!out.status.success(), "it did fail, and must say so: {}", text(&out));
+    let ledger = rig.ledger();
+    assert!(ledger.contains("started over"), "the range refusal is still explained: {ledger}");
+    assert!(ledger.contains("ffmpeg not found"), "but the REAL cause is named: {ledger}");
+    assert!(
+        !ledger.contains("delete the leftover"),
+        "and no advice to delete a file the restart already consumed: {ledger}"
+    );
 }
 
 #[test]

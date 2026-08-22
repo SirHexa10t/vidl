@@ -132,6 +132,10 @@ pub fn run(args: Args) -> i32 {
             names::DEFAULT_NAME_MAX
         );
     }
+    // Also once, and for the same reason as the limit probe above: leftovers from an interrupted
+    // run sit wherever it was writing, so the destination is swept as a whole before anything new
+    // is downloaded into it rather than checked per video.
+    crate::media::discard_stale_parts(&args.into);
     let env = args.env();
     let link = crate::classify(&url, args.single);
     // `--multi` is for pages that give yt-dlp no structure to read. YouTube gives it plenty, and

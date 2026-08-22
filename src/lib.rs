@@ -574,7 +574,9 @@ const NOTABLE_FLAGS: &[(&str, &str)] = &[
     ("--write-info-json", "save every scrap of metadata as JSON"),
     ("--playlist-items 3,5-7", "download only a slice of a playlist"),
     ("--limit-rate 2M", "cap the download speed"),
-    ("--merge-output-format webm/mkv", "prefer webm (forfeits embedded cover art)"),
+    // Both losses are real and both are mkv-only: cover art rides as an attachment, and subtitle
+    // streams have to survive a `-c copy` remux. Naming only the first would understate the cost.
+    ("--merge-output-format webm/mkv", "prefer webm (forfeits cover art and embedded subtitles)"),
     ("--sub-langs all", "every real subtitle language, not just EN"),
     ("--proxy URL", "route through a proxy"),
 ];
