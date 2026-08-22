@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::Path;
 
-use crate::util::exec::{capture_output, capture_stdout};
+use crate::util::exec::{COLD_ATTEMPTS, ask_repeatedly, capture_output, capture_stdout};
 use super::{Env, seeded, ytdlp_invocation};
 use crate::util::stamp;
 
@@ -37,7 +37,37 @@ pub(crate) enum TabScan {
 /// Scan a channel tab with stderr captured, so "this channel has no such tab" — yt-dlp's error,
 /// but an everyday reality — turns into a calm message instead of an ERROR dump; anything else
 /// on stderr is passed through as the real failure it is.
+/// Ask a channel tab for its videos, more than once if the first ask is refused.
+///
+/// Only a *hard* failure is asked again. [`TabScan::Missing`] is an answer — the channel really has
+/// no such tab — and asking three times would not change it.
+///
+/// The refusal worth retrying costs a whole tab's worth of videos, silently: the caller's only
+/// recourse is to say so and move on, and a channel quietly missing its shorts looks exactly like a
+/// channel that has none. See [`COLD_ATTEMPTS`] for what does the refusing.
 pub(crate) fn scan_tab(url: &str, dir_template: &str, env: Env) -> TabScan {
+    let tab = url.trim_end_matches('/').rsplit('/').next().unwrap_or("tab");
+    let mut refusal = String::new();
+    let asked = ask_repeatedly(&format!("the `{tab}` tab"), COLD_ATTEMPTS, || {
+        match scan_tab_once(url, dir_template, env) {
+            Ok(scan) => Some(scan),
+            Err(stderr) => {
+                refusal = stderr;
+                None
+            }
+        }
+    });
+    asked.unwrap_or_else(|| {
+        // Only the last attempt's complaint reaches the user: three copies of one error reads as
+        // three problems.
+        eprint!("{refusal}");
+        TabScan::Failed
+    })
+}
+
+/// One attempt at [`scan_tab`]. `Err` holds what yt-dlp complained about, for the caller to show
+/// if no later attempt does better.
+fn scan_tab_once(url: &str, dir_template: &str, env: Env) -> Result<TabScan, String> {
     let mut args = seeded(env);
     args.extend([
         OsString::from("--flat-playlist"),
@@ -47,19 +77,18 @@ pub(crate) fn scan_tab(url: &str, dir_template: &str, env: Env) -> TabScan {
     ]);
     let (program, args) = ytdlp_invocation(args);
     let Some((ok, stdout, stderr)) = capture_output(program, args) else {
-        return TabScan::Failed;
+        return Err(String::new()); // could not be spawned; exec already said so
     };
     if ok {
         if let Some(scan) = parse_scan(&stdout) {
-            return TabScan::Found(scan);
+            return Ok(TabScan::Found(scan));
         }
-        return TabScan::Missing; // reachable but empty: nothing to download either way
+        return Ok(TabScan::Missing); // reachable but empty: nothing to download either way
     }
     if tab_absence(&stderr) {
-        return TabScan::Missing;
+        return Ok(TabScan::Missing);
     }
-    eprint!("{stderr}");
-    TabScan::Failed
+    Err(stderr)
 }
 
 /// Whether yt-dlp's stderr says the tab doesn't exist (its stable phrasing:
@@ -71,7 +100,18 @@ fn tab_absence(stderr: &str) -> bool {
 /// One flat invocation lists the entries AND prints the collection's folder name (playlist
 /// scope, sanitized by the `S` conversion in `dir_template` — a channel tab's flat entries
 /// often lack `uploader`/`channel_id`, the `NA[NA]` trap, while the tab's own fields don't).
+/// Ask a playlist for its entries, more than once if the first ask is refused.
+///
+/// Worth retrying because of what the caller does without it: downloads the playlist in one pass,
+/// with EN-only subtitles and no unplayable report. That is a real loss of function to buy from a
+/// single refused request — and the refusal in question is one that clears on the next ask. See
+/// [`COLD_ATTEMPTS`].
 pub(crate) fn scan_playlist(url: &str, dir_template: &str, env: Env) -> Option<PlaylistScan> {
+    ask_repeatedly("the playlist", COLD_ATTEMPTS, || scan_playlist_once(url, dir_template, env))
+}
+
+/// One attempt at [`scan_playlist`].
+fn scan_playlist_once(url: &str, dir_template: &str, env: Env) -> Option<PlaylistScan> {
     let mut argv = seeded(env);
     argv.extend([
         OsString::from("--flat-playlist"),

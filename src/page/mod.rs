@@ -43,7 +43,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::Env;
-use crate::util::exec::capture_stdout_in;
+use crate::util::exec::{COLD_ATTEMPTS, ask_repeatedly, capture_stdout_in};
 use crate::util::style;
 use crate::ytdlp::failures::{GeoRescue, diagnose_failure, write_ledger};
 use crate::ytdlp::{generic_argv, launch, names, seeded, ytdlp_invocation};
@@ -181,6 +181,18 @@ fn download_each(
 /// forced address family, a spoofed region. The page that prompted this is edge-blocked without
 /// them.
 fn scan_page(url: &str, env: Env) -> Option<Scan> {
+    let scan = ask_repeatedly("the page", COLD_ATTEMPTS, || scan_once(url, env));
+    if scan.is_none() {
+        eprintln!(
+            "vidl: could not read the page after {COLD_ATTEMPTS} attempts — downloading just the \
+             video it resolves to"
+        );
+    }
+    scan
+}
+
+/// One attempt at [`scan_page`].
+fn scan_once(url: &str, env: Env) -> Option<Scan> {
     let scratch = std::env::temp_dir().join(format!("vidl_page_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).ok()?;

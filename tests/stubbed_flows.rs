@@ -99,6 +99,11 @@ impl Rig {
         fs::write(self.stub.join("page_id.txt"), format!("{resolved}\n")).unwrap();
     }
 
+    /// Have the first page fetch refused, as a cold client's is.
+    fn refuse_first_scan(&self) {
+        fs::write(self.stub.join("refuse_scan_once"), "").unwrap();
+    }
+
     /// The names of everything sitting in the destination root, bookkeeping dotfiles aside.
     fn files(&self) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(&self.into)
@@ -335,6 +340,50 @@ fn a_playlist_scan_reports_tombstones_skips_archived_and_downloads_pending_in_on
 }
 
 #[test]
+fn a_playlist_refused_on_the_first_ask_still_gets_the_full_scanned_treatment() {
+    // A refused scan used to cost the whole scan: the playlist fell back to one undifferentiated
+    // pass with EN-only subtitles and no unplayable report. That is far too much to lose to a
+    // request that works when asked again a moment later.
+    let rig = Rig::new("playlist_scan_retry");
+    fs::write(
+        rig.stub.join("scan.txt"),
+        "1\tvidpend0001\tKeep One\tStub List\n\
+         2\tvidpriv0002\t[Private video]\tStub List\n\
+         Stub List [PLstub]\n",
+    )
+    .unwrap();
+    fs::write(
+        rig.stub.join("probe.txt"),
+        "1\tvidpend0001\the\t{\"he\": [{\"name\": \"Hebrew\"}]}\t{}\n",
+    )
+    .unwrap();
+    fs::write(rig.stub.join("archive_adds.txt"), "youtube vidpend0001\n").unwrap();
+    rig.refuse_first_scan();
+
+    let out = rig.dl("ok", "https://www.youtube.com/playlist?list=PLstub", &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("asking again"), "the retry is announced: {all}");
+    assert!(all.contains("the playlist came through on attempt 2"), "and its success: {all}");
+    assert!(
+        !all.contains("could not scan the playlist"),
+        "the degraded one-pass fallback must NOT be reached: {all}"
+    );
+    // The three things the fallback would have cost, all present: the unplayable report, the
+    // per-entry subtitle plan (`he`, which EN-only would have missed), and the archive skip list.
+    assert!(all.contains("1 of 2 entries are unplayable"), "{all}");
+    assert!(all.contains("downloading 1 entry (subs: he)"), "the scanned plan, not EN-only: {all}");
+    let home = rig.into.join("Stub List [PLstub]");
+    assert!(home.join("unplayable__PLstub.txt").is_file(), "report written: {:?}", rig.files());
+    let calls = rig.calls();
+    assert_eq!(
+        calls.lines().filter(|line| line.contains("--flat-playlist")).count(),
+        2,
+        "asked twice, not more:\n{calls}"
+    );
+}
+
+#[test]
 fn a_channel_walks_every_tab_downloading_reporting_missing_and_failed_ones() {
     let rig = Rig::new("channel");
     // The stub keys tab behaviour off the URL: videos → this scan; shorts → yt-dlp's "no such
@@ -366,7 +415,11 @@ fn a_channel_walks_every_tab_downloading_reporting_missing_and_failed_ones() {
         );
     }
     assert!(all.contains("the channel has no `shorts` tab"), "{all}");
-    assert!(all.contains("Unable to download webpage"), "a failed tab's real error passes through: {all}");
+    assert_eq!(
+        all.matches("Unable to download webpage").count(),
+        1,
+        "a failed tab's real error passes through — ONCE, not once per attempt: {all}"
+    );
     assert!(all.contains("could not read the `streams` tab — moving on"), "{all}");
     assert!(all.contains("the channel has no `playlists` tab"), "reachable-but-empty reads as absent: {all}");
     assert!(all.contains("downloading 2 entries (subs: en)"), "{all}");
@@ -375,7 +428,19 @@ fn a_channel_walks_every_tab_downloading_reporting_missing_and_failed_ones() {
         .expect("archive under the channel home");
     assert!(archive.contains("vidchan0001") && archive.contains("vidchan0002"), "{archive}");
     let calls = rig.calls();
-    assert_eq!(calls.lines().filter(|line| line.contains("--flat-playlist")).count(), 4, "one scan per tab:\n{calls}");
+    // One scan per tab — except the tab that fails HARD, which could be a cold client's first
+    // request being refused and so is asked again. "No such tab" is an answer, not a refusal, and
+    // asking three times would not change it.
+    let scans = |tab: &str| {
+        calls
+            .lines()
+            .filter(|line| line.contains("--flat-playlist") && line.ends_with(tab))
+            .count()
+    };
+    assert_eq!(scans("/videos"), 1, "a tab that answers is asked once:\n{calls}");
+    assert_eq!(scans("/shorts"), 1, "`no such tab` is an answer, not a refusal:\n{calls}");
+    assert_eq!(scans("/playlists"), 1, "reachable-but-empty likewise:\n{calls}");
+    assert_eq!(scans("/streams"), 3, "a hard failure is asked again:\n{calls}");
     let downloads = downloads(&calls);
     assert_eq!(downloads.len(), 1, "the videos tab downloads as one group:\n{calls}");
 }
@@ -784,6 +849,34 @@ fn a_page_hiding_a_collection_is_walked_into_a_folder_in_page_order() {
     for line in &downloads {
         assert!(line.contains("Entry[42]"), "not under the folder: {line}");
     }
+}
+
+/// The bug this cost a user two runs of the same command: the page's first fetch was refused with a
+/// 403 and the download that followed it, to the same URL, was not — so the collection was quietly
+/// abandoned and one video came back. One refusal must not mean "this is not a collection".
+#[test]
+fn a_page_refused_on_the_first_ask_is_asked_again_rather_than_abandoned() {
+    let rig = Rig::new("multi_scan_retry");
+    let ids = ["1_aaaaaaaa", "1_bbbbbbbb", "1_cccccccc"];
+    rig.page(ids[0], &collection_page(&ids));
+    rig.refuse_first_scan();
+
+    let out = rig.dl("ok", "https://media.example.com/series/42/", &["--multi"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("asking again"), "the retry is announced: {all}");
+    assert!(all.contains("came through on attempt 2"), "and so is its success: {all}");
+
+    // And the collection really was walked — not the single-video fallback the refusal used to
+    // cause. Three downloads, into the folder, exactly as an unrefused page gives.
+    assert!(rig.into.join("Entry[42]").is_dir(), "the folder: {:?}", rig.files());
+    let calls = rig.calls();
+    assert_eq!(downloads(&calls).len(), 3, "one download per entry:\n{calls}");
+    assert_eq!(
+        calls.matches("--write-pages").count(),
+        2,
+        "asked twice, not more:\n{calls}"
+    );
 }
 
 /// The promise of the flag. A page with one video on it must come back through the ordinary path,

@@ -104,6 +104,47 @@ where
     }
 }
 
+/// How many times to ask for something before believing the answer is no.
+///
+/// Three, because the *first* request from a client address the far end hasn't seen can be refused
+/// outright — a CDN's bot management commonly answers a cold address with a 403 and lets the next
+/// request through. Seen twice over: a page scan refused while the download that followed it, to the
+/// same URL, succeeded; and the same page refusing every request early in a session and answering
+/// every one later, from an unchanged address. Reproducible by connecting and disconnecting a VPN,
+/// which is what gives the game away — the refusal is keyed to the address, not to the run.
+pub(crate) const COLD_ATTEMPTS: usize = 3;
+
+/// Ask for something up to `attempts` times, saying so when a further go is needed.
+///
+/// For the requests a cold client loses: one refusal must not be taken for an answer. It says what
+/// it is doing, because a *silent* retry is worse than none — a run that stalls twice with no
+/// explanation looks broken. `what` names the thing being asked for and appears in the notices; what
+/// to do when the answer never comes is left to the caller, since that differs by caller.
+///
+/// No pause between attempts. The evidence that an immediate retry works is that the download which
+/// followed a refused scan, moments later, was one. A pause would only help against a rate limit,
+/// and a 403 is not one.
+pub(crate) fn ask_repeatedly<T>(
+    what: &str,
+    attempts: usize,
+    mut ask: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    for attempt in 1..=attempts {
+        if let Some(answer) = ask() {
+            if attempt > 1 {
+                println!("{what} came through on attempt {attempt}");
+            }
+            return Some(answer);
+        }
+        if attempt < attempts {
+            eprintln!(
+                "vidl: could not read {what} (attempt {attempt} of {attempts}) — asking again"
+            );
+        }
+    }
+    None
+}
+
 /// Run `program`, capturing BOTH streams — for callers that must read the failure text before
 /// deciding whether the user should see it (telling "no such tab" from a real network error).
 /// `None` only on a spawn failure.
@@ -124,5 +165,43 @@ where
             eprintln!("could not run {}: {err}", program.to_string_lossy());
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn asking_repeatedly_stops_at_the_first_answer() {
+        let asks = Cell::new(0);
+        let answer = ask_repeatedly("the thing", 3, || {
+            asks.set(asks.get() + 1);
+            (asks.get() == 2).then_some("here")
+        });
+        assert_eq!(answer, Some("here"));
+        assert_eq!(asks.get(), 2, "the third ask is not made once the second answers");
+    }
+
+    #[test]
+    fn asking_repeatedly_gives_up_after_the_allowance_and_says_nothing_of_its_own() {
+        let asks = Cell::new(0);
+        let answer = ask_repeatedly("the thing", COLD_ATTEMPTS, || {
+            asks.set(asks.get() + 1);
+            None::<&str>
+        });
+        assert_eq!(answer, None, "no answer is not an answer");
+        assert_eq!(asks.get(), COLD_ATTEMPTS, "asked its allowance, and not once more");
+    }
+
+    #[test]
+    fn one_attempt_is_a_plain_call() {
+        // The degenerate allowance has to behave, since a caller may compute it.
+        let asks = Cell::new(0);
+        assert_eq!(ask_repeatedly("x", 1, || { asks.set(asks.get() + 1); None::<u8> }), None);
+        assert_eq!(asks.get(), 1);
+        // And a nonsensical one must not loop forever or panic.
+        assert_eq!(ask_repeatedly("x", 0, || Some(1u8)), None, "no attempts means no answer");
     }
 }

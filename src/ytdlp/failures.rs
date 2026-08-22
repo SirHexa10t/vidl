@@ -87,6 +87,30 @@ fn classify_failure(stderr: &str) -> Failure {
     }
 }
 
+/// The ledger line for a failure this crate cannot name — plus the one hint worth giving for the
+/// commonest of them.
+///
+/// The 403 note lives *here*, and not beside the launch, because by this point the plain re-run has
+/// already been tried and has already failed. A lone 403 is very often transient — the first request
+/// from an address the far end has not seen gets refused and the next one does not — so the same
+/// words printed before that re-run would be contradicted as often as not.
+///
+/// And the obvious-sounding remedy is partly backwards, which is why it is worded carefully: moving
+/// to another exit node hands the site an address it has *never* seen, and that is precisely what
+/// gets refused on its own first request. Worth trying for a persistent block; not a free action.
+fn other_line(label: &str, detail: &str) -> String {
+    let mut line = format!("{label} — failed: {detail}");
+    if detail.contains("403") {
+        line.push_str(
+            "\n  (a 403 that survives a retry suggests the site has blocklisted this network's \
+             address — VPN and datacenter exits often are, and --cookies is the other lever. Note \
+             that switching networks presents an address the site has never seen, which can itself \
+             be refused once before it settles.)",
+        );
+    }
+    line
+}
+
 pub(crate) fn capture_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String)> {
     let (program, args) = ytdlp_invocation(argv);
     capture_output(program, args)
@@ -162,7 +186,7 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
                 .find(|line| line.contains("ERROR"))
                 .unwrap_or("unknown error")
                 .trim();
-            Some(dead(format!("{label} — failed: {detail}")))
+            Some(dead(other_line(label, detail)))
         }
     }
 }
@@ -420,6 +444,29 @@ mod tests {
         // don't mislabel it as a bot-wall.
         assert_eq!(classify_failure("ERROR: HTTP Error 403: Forbidden"), Failure::Other);
         assert_eq!(XFF_REGIONS.len(), 12, "a dozen regions, as specified");
+    }
+
+    #[test]
+    fn the_403_hint_appears_only_once_a_retry_has_already_failed_and_does_not_oversell_a_new_network() {
+        // Reached only from the `Other` arm, which runs after the plain diagnostic re-run — so the
+        // hint can afford to talk about a block, which it could not before that re-run.
+        let refused = other_line("clip", "ERROR: unable to download: HTTP Error 403: Forbidden");
+        assert!(refused.starts_with("clip — failed: ERROR:"), "the ledger line comes first: {refused}");
+        assert!(refused.contains("survives a retry"), "it says WHEN it applies: {refused}");
+        assert!(refused.contains("--cookies"), "the other lever is named: {refused}");
+        // The trap this wording exists to avoid: the obvious remedy hands the site an address it
+        // has never seen, and a never-seen address is what draws the first refusal.
+        assert!(
+            refused.contains("never seen"),
+            "switching networks must not be sold as free: {refused}"
+        );
+
+        // Anything else is left alone — a hint attached to unrelated failures is noise, and this
+        // arm is the catch-all for every failure the crate cannot name.
+        for other in ["ERROR: HTTP Error 404: Not Found", "ERROR: ffmpeg exited with code 1"] {
+            let line = other_line("clip", other);
+            assert_eq!(line, format!("clip — failed: {other}"), "no hint for a non-403");
+        }
     }
 
     #[test]

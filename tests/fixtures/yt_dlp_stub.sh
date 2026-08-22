@@ -9,7 +9,8 @@
 # Contract:
 #   VIDL_STUB_DIR   scratch dir — every invocation's argv is appended to calls.log; scan.txt
 #                     and probe.txt hold the --flat-playlist / batch-probe outputs to replay;
-#                     page.txt and page_id.txt hold what a `--multi` page scan finds.
+#                     page.txt and page_id.txt hold what a `--multi` page scan finds; a
+#                     refuse_scan_once file makes the FIRST scan of any kind fail with a 403.
 #   VIDL_STUB_MODE  how a *download* invocation (one with no --print) behaves:
 #     ok                 succeed
 #     fail               fail with a generic error
@@ -39,10 +40,23 @@ emit() {
     if [[ -s "$1" ]]; then printf '%s\n' "$(<"$1")"; fi
 }
 
+# A fetch refused on the FIRST ask and fine on the next — the transient a CDN produces for a cold
+# client, and the reason a scan is asked more than once. Every kind of scan can draw it, so every
+# kind of scan calls this. The "already refused" marker is written rather than the request one
+# deleted, because this script is restricted to bash builtins.
+refuse_once_if_asked() {
+    if [[ -e "$dir/refuse_scan_once" && ! -e "$dir/scan_was_refused" ]]; then
+        : > "$dir/scan_was_refused"
+        echo "ERROR: [generic] x: Unable to download webpage: HTTP Error 403: Forbidden" >&2
+        exit 1
+    fi
+}
+
 # A flat scan. Channel-tab URLs get per-tab behaviour so one channel run exercises every
 # TabScan outcome: videos → the scan, shorts → yt-dlp's "no such tab" error, streams → a hard
 # failure, playlists → scan_playlists.txt (empty ⇒ a reachable-but-empty tab).
 if [[ "$args" == *" --flat-playlist "* ]]; then
+    refuse_once_if_asked
     case "$args" in
         *"/shorts "*)
             echo "ERROR: [youtube:tab] @stub: This channel does not have a shorts tab" >&2
@@ -63,6 +77,7 @@ fi
 # so the sibling sweep has something to read. Checked before the general --print branch, which this
 # invocation also matches.
 if [[ "$args" == *" --write-pages "* ]]; then
+    refuse_once_if_asked
     if [[ -f "$dir/page.txt" ]]; then
         # yt-dlp names each dump after the URL it fetched, and the sibling sweep picks the page out
         # of the platform's other responses BY HOST — so the stand-in has to carry the host too.

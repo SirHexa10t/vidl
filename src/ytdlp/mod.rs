@@ -163,13 +163,12 @@ pub(crate) fn launch(argv: Vec<OsString>) -> i32 {
     let (program, args) = ytdlp_invocation(argv);
     let code = run_reporting_code(program, args);
     if code != 0 {
-        // The interpreter's name in the line above obscures the real actor; and the most common
-        // hard failure deserves its diagnosis spelled out.
-        eprintln!(
-            "vidl: yt-dlp failed (exit {code}). A `403 Forbidden` on media usually means the site \
-             has blocklisted this network's IP (VPN / datacenter exits often are) — switching \
-             the node/network tends to fix it, and --cookies is the other lever."
-        );
+        // The fact only — the interpreter's name in the line above obscures the real actor. What
+        // the failure MEANS belongs to `failures`, which is reached after the diagnostic re-run:
+        // advice given here is advice given before the retry that so often makes it moot, and a
+        // scary paragraph contradicted moments later by "succeeded on retry" teaches the user to
+        // ignore both.
+        eprintln!("vidl: yt-dlp failed (exit {code})");
     }
     code
 }
