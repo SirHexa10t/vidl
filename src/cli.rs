@@ -61,6 +61,12 @@ pub struct Args {
     /// the download archive) is for patching previously-downloaded videos on a re-run
     #[arg(long)]
     pub subtitles: bool,
+    /// Look for more than one video on the page. Some sites hide a whole collection behind one
+    /// URL, swapping which video plays without changing the address; this downloads all of them
+    /// into a folder. Off-YouTube only — YouTube publishes collections as playlists and channels,
+    /// which are walked already
+    #[arg(long)]
+    pub multi: bool,
     /// Longest file name the destination accepts, in bytes. Measured from the destination when
     /// left out, which is right for every mainstream filesystem (255); set it for one that takes
     /// less than it reports — an encrypted-filename mount, say, where 143 is typical
@@ -88,6 +94,7 @@ impl Args {
             allow_ipv6: self.allow_ipv6,
             thumbnail: self.thumbnail,
             subtitles: self.subtitles,
+            multi: self.multi,
             extra: &self.extra,
         }
     }
@@ -126,7 +133,16 @@ pub fn run(args: Args) -> i32 {
         );
     }
     let env = args.env();
-    match crate::classify(&url, args.single) {
+    let link = crate::classify(&url, args.single);
+    // `--multi` is for pages that give yt-dlp no structure to read. YouTube gives it plenty, and
+    // this crate walks it; saying so beats letting the flag look like it did something.
+    if args.multi && !matches!(link, Link::Generic) {
+        eprintln!(
+            "vidl: --multi is for sites that hide several videos behind one URL — YouTube \
+             publishes those as playlists and channels, which this walks already; ignoring it"
+        );
+    }
+    match link {
         Link::Video => download_video(&url, &args.into, env),
         Link::Playlist { id } => download_playlist(&url, &id, &args.into, env),
         Link::Channel { root } => download_channel(&root, &args.into, env),

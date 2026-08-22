@@ -78,6 +78,14 @@ Whenever a title still doesn't fit, the run says so in red and writes it in full
 the YouTube path, where a budget is still a prediction, a name the filesystem refuses anyway earns
 one retry at half the title — an uglier name instead of a lost download.
 
+**Collections behind one URL (`--multi`).** Some sites put a whole season on one page, swapping
+which video plays without changing the address. yt-dlp resolves such a page to whichever video the
+player started on, and the rest are lost silently. `--multi` goes looking: it scans the page for
+further references sharing the id shape of the video that *did* resolve, and if it finds several,
+downloads them all into a folder of their own, numbered in page order — practically a playlist, and
+named like one. Opt-in, so a page that already works cannot be disturbed by it, and off-YouTube
+only, since YouTube publishes its collections as playlists and channels that are walked already.
+
 **Failure diagnosis.** A non-zero yt-dlp exit is read for what actually went wrong — geo-block,
 age gate, login wall, bot wall, DRM — and answered with the specific lever that helps, if one
 exists. A geo-blocked video on a site that honours it triggers a region sweep; one enforced by IP
@@ -136,6 +144,16 @@ vidl::tools::install(vidl::tools::Tools {
   Collection titles are far shorter than post captions in practice, and bounding them means
   keeping two independently-computed spellings of the same folder in exact agreement — the scan
   that decides where the archive goes, and the output template that decides where the videos go.
+- **`--multi` has to know the embed platform, and only suits some.** *Finding* the other videos on
+  a page is generic: the id shape is derived from the video that resolved, not looked up per site.
+  Turning a bare id back into something yt-dlp accepts is not — there's no general id-to-URL
+  function across yt-dlp's ~1800 extractors — so `src/page/platforms.rs` carries one entry per embed
+  platform (Kaltura today). One entry serves every site embedding that platform, but a page using an
+  unlisted one has its siblings reported as unreachable rather than guessed at. The table stays
+  small for a reason: because videos are found *by id shape*, a platform only qualifies if its ids
+  can be told apart from ordinary page text. Kaltura's can (`1_8jx8mama`); Brightcove's are plain
+  digits and JW Player's are bare alphanumerics, so neither could be swept for without matching
+  half the page.
 - **No PO-token provider.** yt-dlp's strongest answer to bot-walling isn't wired up; the failure
   advice says so when it's what you'd need.
 - **Linux-shaped.** Developed and tested there. Nothing is deliberately platform-specific beyond

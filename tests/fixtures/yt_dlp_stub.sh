@@ -8,7 +8,8 @@
 #
 # Contract:
 #   VIDL_STUB_DIR   scratch dir — every invocation's argv is appended to calls.log; scan.txt
-#                     and probe.txt hold the --flat-playlist / batch-probe outputs to replay.
+#                     and probe.txt hold the --flat-playlist / batch-probe outputs to replay;
+#                     page.txt and page_id.txt hold what a `--multi` page scan finds.
 #   VIDL_STUB_MODE  how a *download* invocation (one with no --print) behaves:
 #     ok                 succeed
 #     fail               fail with a generic error
@@ -56,6 +57,22 @@ if [[ "$args" == *" --flat-playlist "* ]]; then
             emit "$dir/scan.txt"
             exit 0 ;;
     esac
+fi
+# The `--multi` page scan. The real yt-dlp fetches the page and leaves it in the working directory;
+# this writes page.txt there under a plausible dump name and prints the id the page resolved to,
+# so the sibling sweep has something to read. Checked before the general --print branch, which this
+# invocation also matches.
+if [[ "$args" == *" --write-pages "* ]]; then
+    if [[ -f "$dir/page.txt" ]]; then
+        # yt-dlp names each dump after the URL it fetched, and the sibling sweep picks the page out
+        # of the platform's other responses BY HOST — so the stand-in has to carry the host too.
+        for last in "$@"; do :; done
+        host="${last#*://}"
+        host="${host%%/*}"
+        printf '%s\n' "$(<"$dir/page.txt")" > "./page_https_-_${host}_x.dump"
+    fi
+    emit "$dir/page_id.txt"
+    exit 0
 fi
 if [[ "$args" == *" --print "* ]]; then
     if [[ "$args" == *" --playlist-items "* ]]; then

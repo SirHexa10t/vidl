@@ -3,7 +3,8 @@
 //! The conductor is here: [`classify`] decides whether a URL is a video, a playlist or a whole
 //! channel, and the `download_*` entry points run it, **one video at a time**. That costs an extra
 //! metadata request per video and buys the thing a single batch invocation cannot express —
-//! per-video subtitle selection against YouTube's ~157-language caption matrix (see [`subtitles`]).
+//! per-video subtitle selection against YouTube's ~157-language caption matrix (see
+//! `media::subtitles`).
 //!
 //! The work splits in two, and the directories say which half a file is in:
 //!
@@ -11,6 +12,8 @@
 //!   failed-downloads ledger, playlist/channel-tab enumeration.
 //! - `media/` — working on what came *back*: thumbnail, subtitle-track and audio-tag patching,
 //!   and the per-video subtitle plan drawn from the caption matrix.
+//! - `page/` — what a *page* lists, when it lists more than one video: reached only through
+//!   `--multi`, so nothing in it runs on a page that already works.
 //! - `tools`/`util` — where the external programs live, and the handful of dependency-free
 //!   helpers (process, colour, timestamp) the two halves share.
 //!
@@ -37,6 +40,7 @@ pub mod tools;
 
 mod cli;
 mod media;
+mod page;
 mod util;
 mod ytdlp;
 
@@ -67,6 +71,10 @@ pub struct Env<'a> {
     /// subtitles and embed any that are missing. A fresh download already embeds subtitles
     /// inline, so this is a no-op there and a patch on re-runs.
     pub subtitles: bool,
+    /// Look for more than one video on the page. Off-YouTube only: a page that hides a whole
+    /// collection behind one URL is downloaded as that collection instead of as its featured
+    /// video. Opt-in, so a page that already works cannot be disturbed by it.
+    pub multi: bool,
     /// Raw passthrough args, appended after every default so they win any flag repeated.
     pub extra: &'a [String],
 }
@@ -248,11 +256,11 @@ const PATCHABLE_PLATFORMS: &[&str] = &["youtube"];
 
 /// The generic single-video path for non-YouTube sites (`dl` routes here when the host isn't
 /// YouTube). One download, flat into `into` — a generic page gives no playlist/channel structure
-/// to build folders from — reusing this module's shared argv base ([`common`]), failure
+/// to build folders from — reusing this module's shared argv base (`ytdlp::common`), failure
 /// diagnosis + rescue, ledger, and download archive. No subtitle probing: that's a
 /// YouTube-caption-matrix affair, so a generic site just gets the media, metadata, thumbnail, and
 /// chapters. The URL is the ledger label — the only stable key without a metadata probe (and
-/// enough for [`scrub_ledger`] when it embeds the id).
+/// enough for `scrub_ledger` when it embeds the id).
 pub fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
     // The patch passes need a per-video id in the filename and a known thumbnail/caption source —
     // YouTube-machinery, today. Name what IS supported (the list will grow) instead of silently
@@ -268,6 +276,15 @@ pub fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
             PATCHABLE_PLATFORMS.join(", ")
         );
     }
+    // `--multi`: this page may be a collection wearing a single URL. Everything that decides so,
+    // and everything that acts on it, lives in `page` — a page that isn't one comes straight back
+    // here and downloads exactly as it always did.
+    if env.multi {
+        if let Some(code) = page::download_collection(url, into, env) {
+            scrub_ledger(into);
+            return code;
+        }
+    }
     let mut code = launch(generic_argv(url, into, env));
     if code != 0 {
         match diagnose_failure(generic_argv(url, into, env), url, GeoRescue::XffSweep) {
@@ -281,7 +298,7 @@ pub fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
     if names::caller_named_output(env.extra) {
         names::discard_names(into);
     } else {
-        names::rename_downloaded(into, names::limit());
+        names::rename_downloaded(into, names::limit(), None);
     }
     scrub_ledger(into);
     code

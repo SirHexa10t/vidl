@@ -92,6 +92,13 @@ impl Rig {
         fs::write(self.stub.join("names_adds.txt"), line).unwrap();
     }
 
+    /// Script what a `--multi` page scan finds: the page's own text, and the id yt-dlp resolves it
+    /// to. The stub writes the page into its working directory the way `--write-pages` does.
+    fn page(&self, resolved: &str, body: &str) {
+        fs::write(self.stub.join("page.txt"), body).unwrap();
+        fs::write(self.stub.join("page_id.txt"), format!("{resolved}\n")).unwrap();
+    }
+
     /// The names of everything sitting in the destination root, bookkeeping dotfiles aside.
     fn files(&self) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(&self.into)
@@ -695,6 +702,120 @@ fn a_smaller_name_max_shrinks_the_title_bound_it_asks_yt_dlp_for() {
         "a non-default limit is worth saying out loud: {}",
         text(&out)
     );
+}
+
+/// A page in the shape `--multi` exists for: a homogeneous list of entries behind one URL, plus the
+/// player script whose host carries the account the media actually lives under. Synthetic — what
+/// matters is the structure, which is what the sweep reads.
+fn collection_page(ids: &[&str]) -> String {
+    let titles: Vec<String> = (0..ids.len()).map(|i| format!("Entry {i}")).collect();
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    collection_page_titled(ids, &refs)
+}
+
+/// The same page, with the entry titles named explicitly — for the ordering cases.
+fn collection_page_titled(ids: &[&str], titles: &[&str]) -> String {
+    let mut page = String::from("<html><head><title>Some Series, Season 6</title></head><body>");
+    // The site's own account, declared and repeated — the decoy that must not win.
+    page.push_str(r#"<script>{"partner_id":"5031"}</script>"#);
+    for _ in 0..4 {
+        page.push_str(r#"<img src="https://cdn.site.test/image/p/5031/thumb.jpg">"#);
+    }
+    page.push_str(r#"<script src="https://cdnapisec.kaltura.com/p/2748741/embedPlaykitJs/x">"#);
+    page.push_str(r#"<script>{"items":["#);
+    for (title, id) in titles.iter().zip(ids) {
+        page.push_str(&format!(
+            r#"{{"title":"{title}","description":"a synopsis","entryId":"{id}"}},"#
+        ));
+    }
+    page.push_str("]}</script></body></html>");
+    page
+}
+
+/// The whole feature end to end: a page that resolves to one video but lists several is collected
+/// into a folder of its own, in the order the page lists them, addressed through the account the
+/// player script names rather than the one the page declares about itself.
+#[test]
+fn a_page_hiding_a_collection_is_walked_into_a_folder_in_page_order() {
+    let rig = Rig::new("multi_collection");
+    let ids = ["1_aaaaaaaa", "1_bbbbbbbb", "1_cccccccc"];
+    rig.page(ids[0], &collection_page(&ids));
+
+    let out = rig.dl("ok", "https://media.example.com/series/42/", &["--multi"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("lists 3 Kaltura videos"), "the count is announced: {all}");
+    // These entries carry their own numbers, so those are what the files are numbered by rather
+    // than the order the page happened to list them in.
+    assert!(all.contains("by the numbers in their own names"), "the numbering is announced: {all}");
+
+    // A folder of its own, named for what the entries have in common plus the page's identifier —
+    // the shape a playlist gets. The entries here are titled "Entry 0/1/2", so the opening they
+    // share is "Entry"; the page's own <title> loses to it, which is the whole point of the
+    // layering (on a real page that title is the *featured* episode).
+    let home = rig.into.join("Entry[42]");
+    assert!(home.is_dir(), "the collection needs a folder: {:?}", rig.files());
+    assert!(
+        !rig.into.join("Some Series, Season 6[42]").exists(),
+        "the page title must not win while the entries share an opening"
+    );
+
+    // One download per entry, addressed through the player's account (2748741) and NOT the one the
+    // page declares as its own (5031), which Kaltura rejects.
+    let calls = rig.calls();
+    let downloads = downloads(&calls);
+    assert_eq!(downloads.len(), 3, "one download each:\n{calls}");
+    for (position, id) in ids.iter().enumerate() {
+        let target = format!("kaltura:2748741:{id}");
+        assert!(
+            downloads[position].contains(&target),
+            "entry {} must be #{} in page order, got: {}",
+            id,
+            position + 1,
+            downloads[position]
+        );
+    }
+    assert!(!rig.calls().contains("kaltura:5031:"), "the page's own account must not be used");
+    // And every file lands in the collection's folder, not the destination root.
+    for line in &downloads {
+        assert!(line.contains("Entry[42]"), "not under the folder: {line}");
+    }
+}
+
+/// The promise of the flag. A page with one video on it must come back through the ordinary path,
+/// untouched — that is what makes `--multi` safe to add to a tool that already works.
+#[test]
+fn multi_on_an_ordinary_page_falls_back_to_the_single_download() {
+    let rig = Rig::new("multi_single");
+    rig.page("1_aaaaaaaa", &collection_page(&["1_aaaaaaaa"]));
+
+    let out = rig.dl("ok", "https://media.example.com/v/9", &["--multi"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("nothing for --multi to collect"),
+        "it must say so rather than silently doing nothing: {}",
+        text(&out)
+    );
+    // No folder, and the download is the plain one: named by its id, straight under `into`.
+    assert!(rig.files().is_empty() || !rig.into.join("Some Series, Season 6[9]").exists());
+    let templates = output_templates(&rig.calls());
+    assert_eq!(templates.len(), 1, "exactly one download: {templates:?}");
+    assert!(templates[0].contains("%(id)."), "the ordinary generic template: {}", templates[0]);
+}
+
+/// `--multi` is for sites that give yt-dlp no structure to read. YouTube gives it plenty, and this
+/// crate walks it — so the flag says it is being ignored rather than appearing to have done work.
+#[test]
+fn multi_is_refused_on_youtube_where_collections_are_already_walked() {
+    let rig = Rig::new("multi_youtube");
+    let out = rig.dl("ok", YT_VIDEO, &["--multi"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("--multi is for sites"), "the refusal is explained: {all}");
+    assert!(all.contains("playlists and channels"), "and points at what does work: {all}");
+    // It really is inert: no page scan, and the ordinary lone-video flow ran.
+    assert!(!rig.calls().contains("--write-pages"), "no page scan on YouTube:\n{}", rig.calls());
+    assert!(all.contains("probing subtitles"), "the YouTube path is unchanged: {all}");
 }
 
 /// A look-alike path on somebody else's host must not be mistaken for a YouTube channel — the

@@ -78,6 +78,32 @@ where
     }
 }
 
+/// [`capture_stdout`], but run from `dir`.
+///
+/// For the one invocation whose *side effect* is written relative to the working directory rather
+/// than to a path we chose: `yt-dlp --write-pages` drops what it fetched beside the caller, so it
+/// gets a directory of its own instead of littering wherever `vidl` was started from.
+pub(crate) fn capture_stdout_in<P, I, S>(dir: &std::path::Path, program: P, args: I) -> Option<String>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let program = program.as_ref();
+    match spawnable(program).current_dir(dir).args(args).output() {
+        Ok(out) => {
+            if !out.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            }
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Err(err) => {
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
+            None
+        }
+    }
+}
+
 /// Run `program`, capturing BOTH streams — for callers that must read the failure text before
 /// deciding whether the user should see it (telling "no such tab" from a real network error).
 /// `None` only on a spawn failure.

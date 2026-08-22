@@ -342,17 +342,34 @@ fn cut_to(text: &str, bytes: usize) -> &str {
 /// finished, so `.f<format_id>` and `.part-Frag<n>` no longer exist. Nor for the sanitizer, since
 /// [`sanitize`] substitutes byte-for-byte. That is where the extra ~80 bytes of title come from
 /// against a template handed to yt-dlp before any of those lengths were known.
-pub(crate) fn final_name(title: &str, id: &str, ext: &str, limit: usize) -> String {
+pub(crate) fn final_name(prefix: &str, title: &str, id: &str, ext: &str, limit: usize) -> String {
     let id = cut_to(&sanitize(id), ID_BYTES).to_string();
     let ext = sanitize(ext);
-    let kept = cut_to(&sanitize(title), title_room(&id, &ext, limit)).trim_end().to_string();
+    let kept =
+        cut_to(&sanitize(title), title_room(prefix, &id, &ext, limit)).trim_end().to_string();
     // A title that sanitized away to nothing would leave a name opening with " [" — the id alone
     // reads better and is still unique.
     if kept.is_empty() {
-        format!("{id}.{ext}")
+        format!("{prefix}{id}.{ext}")
     } else {
-        format!("{kept} [{id}].{ext}")
+        format!("{prefix}{kept} [{id}].{ext}")
     }
+}
+
+/// The ordering prefix a collected video's name carries: its position on the page, zero-padded —
+/// the same `NNN__` shape a YouTube playlist entry gets. Empty for a lone download.
+pub(crate) fn position_prefix(position: Option<usize>) -> String {
+    position.map(|at| format!("{at:03}__")).unwrap_or_default()
+}
+
+/// `text` as a single path component, made safe and cut to `bytes`.
+///
+/// For a folder this crate names *itself* — the `--multi` collection folder. A folder is a path
+/// component and overruns exactly as a file name does. The YouTube collection folders are yt-dlp's
+/// to name from a template and are not bounded (see the README's limitations); this one is ours,
+/// so it is.
+pub(crate) fn component(text: &str, bytes: usize) -> String {
+    cut_to(&sanitize(text), bytes).trim_end().to_string()
 }
 
 /// Whether the caller named their own output template after `--`.
@@ -366,8 +383,10 @@ pub(crate) fn caller_named_output(extra: &[String]) -> bool {
 /// The bytes a title gets inside a finished generic name: whatever `limit` has left once ` [`, the
 /// id, `].` and the extension are seated. Split out because the caller reports it — a notice that
 /// says how much of a title survived has to be told by whoever cut it.
-pub(crate) fn title_room(id: &str, ext: &str, limit: usize) -> usize {
-    limit.saturating_sub(2 + cut_to(&sanitize(id), ID_BYTES).len() + 2 + sanitize(ext).len())
+pub(crate) fn title_room(prefix: &str, id: &str, ext: &str, limit: usize) -> usize {
+    limit.saturating_sub(
+        prefix.len() + 2 + cut_to(&sanitize(id), ID_BYTES).len() + 2 + sanitize(ext).len(),
+    )
 }
 
 /// The same argv with its `--output` title bound halved, for one retry after the filesystem
@@ -594,13 +613,14 @@ fn take_scratch(dir: &Path) -> Option<Vec<Recorded>> {
 ///
 /// A file that can't be renamed keeps its temporary name. That is a poor name, not a lost
 /// download — the graceful degradation the bounded-template approach could not offer.
-pub(crate) fn rename_downloaded(dir: &Path, limit: usize) {
+pub(crate) fn rename_downloaded(dir: &Path, limit: usize, position: Option<usize>) {
     let Some(records) = take_scratch(dir) else { return };
+    let prefix = position_prefix(position);
     let mut cut = Vec::new();
     for record in records {
         let from = Path::new(&record.path);
         let Some(ext) = from.extension().and_then(|ext| ext.to_str()) else { continue };
-        let wanted = final_name(&record.title, &record.id, ext, limit);
+        let wanted = final_name(&prefix, &record.title, &record.id, ext, limit);
         if from.file_name().is_some_and(|name| name == wanted.as_str()) {
             continue; // already right — nothing was temporary about it
         }
@@ -621,7 +641,7 @@ pub(crate) fn rename_downloaded(dir: &Path, limit: usize) {
         // record that keys itself by the whole one.
         let whole = sanitize(&record.title);
         if !wanted.contains(whole.trim_end()) || record.id.len() > ID_BYTES {
-            let room = title_room(&record.id, ext, limit);
+            let room = title_room(&prefix, &record.id, ext, limit);
             cut.push((record.id, record.title, room));
         }
     }
@@ -784,7 +804,7 @@ mod tests {
         // are known and yt-dlp's working suffixes are gone, so nothing is reserved against a guess
         // — the title gets everything the limit has left.
         let title = "T".repeat(400);
-        let name = final_name(&title, "1023581733834265", "mp4", DEFAULT_NAME_MAX);
+        let name = final_name("", &title, "1023581733834265", "mp4", DEFAULT_NAME_MAX);
         assert!(name.len() <= DEFAULT_NAME_MAX, "{} bytes overruns", name.len());
         assert!(name.ends_with(" [1023581733834265].mp4"), "{name}");
         let kept = name.len() - " [1023581733834265].mp4".len();
@@ -794,17 +814,26 @@ mod tests {
             yt_title_budget(DEFAULT_NAME_MAX)
         );
         // And it fills the component exactly: the title took every byte that was left.
-        assert_eq!(kept, title_room("1023581733834265", "mp4", DEFAULT_NAME_MAX));
+        assert_eq!(kept, title_room("", "1023581733834265", "mp4", DEFAULT_NAME_MAX));
 
         // A title that fits arrives whole, with no cutting and no trailing space before the id.
-        let short = final_name("A fine title", "vid1", "mkv", DEFAULT_NAME_MAX);
+        let short = final_name("", "A fine title", "vid1", "mkv", DEFAULT_NAME_MAX);
         assert_eq!(short, "A fine title [vid1].mkv");
         // A title that sanitizes away to nothing would leave a name opening with " [".
-        assert_eq!(final_name("   ", "vid1", "mkv", DEFAULT_NAME_MAX), "vid1.mkv");
+        assert_eq!(final_name("", "   ", "vid1", "mkv", DEFAULT_NAME_MAX), "vid1.mkv");
         // An id long enough to matter is bounded here too — the URL-derived kind.
-        let long_id = final_name("t", &"u".repeat(120), "mp4", DEFAULT_NAME_MAX);
+        let long_id = final_name("", "t", &"u".repeat(120), "mp4", DEFAULT_NAME_MAX);
         assert!(long_id.contains(&"u".repeat(ID_BYTES)), "{long_id}");
         assert!(!long_id.contains(&"u".repeat(ID_BYTES + 1)), "the id is bounded: {long_id}");
+
+        // A collected video leads with its position on the page, and pays for it out of the title
+        // — the prefix shares the component, so it cannot be free.
+        let numbered = final_name(&position_prefix(Some(7)), &title, "vid1", "mkv", DEFAULT_NAME_MAX);
+        assert!(numbered.starts_with("007__"), "zero-padded, sortable: {numbered}");
+        assert!(numbered.len() <= DEFAULT_NAME_MAX);
+        let plain = final_name("", &title, "vid1", "mkv", DEFAULT_NAME_MAX);
+        assert_eq!(plain.len(), numbered.len(), "the prefix comes out of the title, not the limit");
+        assert_eq!(position_prefix(None), "", "a lone download is not numbered");
     }
 
     #[test]
@@ -821,7 +850,7 @@ mod tests {
         )
         .unwrap();
 
-        rename_downloaded(&dir, DEFAULT_NAME_MAX);
+        rename_downloaded(&dir, DEFAULT_NAME_MAX, None);
         let record = std::fs::read_to_string(dir.join(MODIFIED_LEDGER))
             .expect("a cut id is worth recording even when the title fitted");
         assert!(record.contains(&long_id), "keyed by the id in full: {record}");
