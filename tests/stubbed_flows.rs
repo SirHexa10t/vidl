@@ -232,8 +232,8 @@ fn a_run_clears_unfinishable_leftovers_from_the_destination_before_downloading()
     // The litter an interrupted older run leaves behind: partial files named without a rendition,
     // which the current naming can never resume and so would otherwise sit there forever.
     let rig = Rig::new("stale_sweep");
-    let stale = rig.into.join("1_niery1hs.mp4.part");
-    let mine = rig.into.join("S6E01__1_aaaaaaaa.mp4.part");
+    let stale = rig.into.join("1_m3n4o5p6.mp4.part");
+    let mine = rig.into.join("S3E01__1_aaaaaaaa.mp4.part");
     let theirs = rig.into.join("quarterly report.pdf.part");
     for path in [&stale, &mine, &theirs] {
         fs::write(path, vec![b'x'; 4096]).unwrap();
@@ -247,7 +247,7 @@ fn a_run_clears_unfinishable_leftovers_from_the_destination_before_downloading()
     // Deleting a user's file silently would be indefensible — it has to be said, by full path and
     // with what it recovered.
     assert!(all.contains("unfinishable partial download"), "the sweep announces itself: {all}");
-    assert!(all.contains("1_niery1hs.mp4.part"), "and names what it removed: {all}");
+    assert!(all.contains("1_m3n4o5p6.mp4.part"), "and names what it removed: {all}");
     assert!(all.contains("4.0 KiB"), "and what that recovered: {all}");
 }
 
@@ -280,6 +280,26 @@ fn a_resume_the_server_refuses_restarts_the_file_instead_of_giving_up() {
         calls.matches("--no-continue").count(),
         1,
         "only the restart carries it — resuming stays the default for genuinely partial files:\n{calls}"
+    );
+}
+
+#[test]
+fn a_format_the_site_lists_but_cannot_serve_falls_through_to_one_it_can() {
+    // Seen in the wild on a Kaltura entry: all three progressive MP4 flavours 404 while all three
+    // HLS renditions serve, and the MP4s rank higher only because HLS reports unknown codecs. So
+    // the best format by metadata is one whose file does not exist.
+    let rig = Rig::new("format_missing");
+    let out = rig.dl("format_missing_unless_checked", YT_VIDEO, &[]);
+    assert!(out.status.success(), "another format rescues it: {}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("missing from the server — trying the others"), "announced: {all}");
+    assert!(all.contains("succeeded on another format"), "and its outcome: {all}");
+    assert!(rig.ledger().is_empty(), "a rescued download must not be ledgered: {}", rig.ledger());
+    let calls = rig.calls();
+    assert_eq!(
+        calls.matches("--check-formats").count(),
+        1,
+        "only the retry pays for probing — a healthy download must not:\n{calls}"
     );
 }
 
@@ -846,11 +866,11 @@ fn collection_page(ids: &[&str]) -> String {
 fn collection_page_titled(ids: &[&str], titles: &[&str]) -> String {
     let mut page = String::from("<html><head><title>Some Series, Season 6</title></head><body>");
     // The site's own account, declared and repeated — the decoy that must not win.
-    page.push_str(r#"<script>{"partner_id":"5031"}</script>"#);
+    page.push_str(r#"<script>{"partner_id":"8642"}</script>"#);
     for _ in 0..4 {
-        page.push_str(r#"<img src="https://cdn.site.test/image/p/5031/thumb.jpg">"#);
+        page.push_str(r#"<img src="https://cdn.site.test/image/p/8642/thumb.jpg">"#);
     }
-    page.push_str(r#"<script src="https://cdnapisec.kaltura.com/p/2748741/embedPlaykitJs/x">"#);
+    page.push_str(r#"<script src="https://cdnapisec.kaltura.com/p/1234567/embedPlaykitJs/x">"#);
     page.push_str(r#"<script>{"items":["#);
     for (title, id) in titles.iter().zip(ids) {
         page.push_str(&format!(
@@ -893,13 +913,13 @@ fn a_page_hiding_a_collection_is_walked_into_a_folder_in_page_order() {
         "the page title must not win while the entries share an opening"
     );
 
-    // One download per entry, addressed through the player's account (2748741) and NOT the one the
-    // page declares as its own (5031), which Kaltura rejects.
+    // One download per entry, addressed through the player's account (1234567) and NOT the one the
+    // page declares as its own (8642), which Kaltura rejects.
     let calls = rig.calls();
     let downloads = downloads(&calls);
     assert_eq!(downloads.len(), 3, "one download each:\n{calls}");
     for (position, id) in ids.iter().enumerate() {
-        let target = format!("kaltura:2748741:{id}");
+        let target = format!("kaltura:1234567:{id}");
         assert!(
             downloads[position].contains(&target),
             "entry {} must be #{} in page order, got: {}",
@@ -908,7 +928,7 @@ fn a_page_hiding_a_collection_is_walked_into_a_folder_in_page_order() {
             downloads[position]
         );
     }
-    assert!(!rig.calls().contains("kaltura:5031:"), "the page's own account must not be used");
+    assert!(!rig.calls().contains("kaltura:8642:"), "the page's own account must not be used");
     // And every file lands in the collection's folder, not the destination root.
     for line in &downloads {
         assert!(line.contains("Entry[42]"), "not under the folder: {line}");

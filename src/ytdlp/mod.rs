@@ -100,10 +100,21 @@ pub(crate) const ARCHIVE_NAME: &str = ".dl_video_archive.txt";
 pub(crate) fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsString> {
     // `--ignore-errors` also keeps subtitle picks must-try: a 429'd track warns and is skipped
     // without failing the video (see `sub_picks_for`).
-    let mut argv: Vec<OsString> = ["--ignore-errors", "--concurrent-fragments", "4"]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
+    //
+    // `--downloader-args` quiets the ffmpeg *downloader*, which yt-dlp reaches for when a stream
+    // needs muxing it cannot do itself — an AES-128 HLS stream, most often. yt-dlp passes ffmpeg
+    // only `-hide_banner` and leaves its log level at the default `info`, at which ffmpeg announces
+    // every segment it opens: measured at 161 lines and 144 KB for one 26-minute episode, because
+    // each line carries a signed CDN URL. `-stats` asks for the progress line back, since at that
+    // level it is the only sign of life during the mux.
+    let mut argv: Vec<OsString> = [
+        "--ignore-errors",
+        "--concurrent-fragments", "4",
+        "--downloader-args", "ffmpeg:-loglevel error -stats",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
     argv.extend(ipv4_flag(env));
     if !langs.is_empty() {
         argv.extend(["--write-subs", "--write-auto-subs", "--sub-langs"].map(OsString::from));
@@ -362,6 +373,13 @@ mod tests {
             Env { res: Some(720), extra: &extra, ..Default::default() },
         );
         let text: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        // The ffmpeg downloader is quieted on every path, not just the retries: a first-attempt
+        // HLS download reaches for ffmpeg exactly the same way, and at ffmpeg's default log level
+        // it names every segment it opens — one signed CDN URL per line.
+        let quieted = text.windows(2).any(|pair| {
+            pair[0] == "--downloader-args" && pair[1].starts_with("ffmpeg:") && pair[1].contains("-loglevel error")
+        });
+        assert!(quieted, "the ffmpeg downloader must be quieted: {text:?}");
         // Same shared knobs + log files as the YouTube path (metadata, thumbnail, mkv, archive).
         for expected in ["--embed-metadata", "--merge-output-format", "mkv", "--download-archive", "/dl/.dl_video_archive.txt"] {
             assert!(text.contains(&expected.to_string()), "missing {expected}: {text:?}");

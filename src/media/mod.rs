@@ -889,20 +889,20 @@ mod tests {
     #[test]
     fn discarding_stale_parts_takes_only_the_unfinishable_ones() {
         let dir = scratch_dir("stale_parts");
-        std::fs::create_dir_all(dir.join("Season 6[2025881]")).unwrap();
+        std::fs::create_dir_all(dir.join("Season 3[9001234]")).unwrap();
         let write = |rel: &str| {
             std::fs::write(dir.join(rel), b"xxxx").unwrap();
             dir.join(rel)
         };
         // Must GO: the old scheme, at the root and nested in a collection folder.
-        let old_root = write("1_niery1hs.mp4.part");
-        let old_nested = write("Season 6[2025881]/1_8jx8mama.mkv.part");
+        let old_root = write("1_m3n4o5p6.mp4.part");
+        let old_nested = write("Season 3[9001234]/1_a1b2c3d4.mkv.part");
         // Must STAY, each for its own reason.
-        let current = write("Season 6[2025881]/S6E01__1_aaaaaaaa.mp4.part"); // resumable
+        let current = write("Season 3[9001234]/S3E01__1_aaaaaaaa.mp4.part"); // resumable
         let youtube = write("20240101__Title__abcdefghijk.mkv.part"); // resumable
         let browser = write("quarterly report.pdf.part"); // not ours at all
-        let finished = write("1_niery1hs.mp4"); // a finished download
-        let sidecar = write("1_niery1hs.en.vtt"); // not a partial
+        let finished = write("1_m3n4o5p6.mp4"); // a finished download
+        let sidecar = write("1_m3n4o5p6.en.vtt"); // not a partial
 
         discard_stale_parts(&dir);
 
@@ -923,12 +923,12 @@ mod tests {
     fn a_stale_part_is_judged_by_all_three_conditions() {
         // The predicate on its own, so each condition is pinned independently of the walk.
         let stale = |name: &str| is_stale_part(Path::new(name));
-        assert!(stale("1_niery1hs.mp4.part"), "the case this exists for");
+        assert!(stale("1_m3n4o5p6.mp4.part"), "the case this exists for");
         assert!(stale("abc.mkv.part") && stale("abc.opus.part"), "any extension we write");
-        assert!(!stale("1_niery1hs.mp4"), "not a `.part` at all");
+        assert!(!stale("1_m3n4o5p6.mp4"), "not a `.part` at all");
         assert!(!stale("notes.txt.part"), "not an extension we write");
         assert!(!stale("report.pdf.part"), "a browser's partial download");
-        assert!(!stale("S6E01__abc.mp4.part"), "a resumable current-scheme part");
+        assert!(!stale("S3E01__abc.mp4.part"), "a resumable current-scheme part");
         assert!(!stale("a__b.mp4.part"), "`__` anywhere is enough to spare it");
         assert!(!stale(".part"), "a bare suffix has no extension to match");
     }

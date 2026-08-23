@@ -5,6 +5,7 @@
 //! and it keeps `vidl` answerable to nothing but the standard library.
 
 use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 /// Every child this crate spawns gets a **null stdin**, and this is the reason.
@@ -143,6 +144,71 @@ pub(crate) fn ask_repeatedly<T>(
         }
     }
     None
+}
+
+/// Run `program`, letting BOTH streams through to the user as they arrive *and* capturing them.
+///
+/// For the retries. [`capture_output`] hides everything until the child exits, which is right for a
+/// probe and wrong for a retry that downloads a whole video: minutes of silence, indistinguishable
+/// from a hang, and the lines saying what is being tried arrive far too late to be read as progress.
+///
+/// Raw bytes rather than lines, because yt-dlp draws its progress with carriage returns *inside* one
+/// line — a line-buffered echo would hold the entire download back and then dump it at the end,
+/// which is the problem this is here to solve. The bytes are decoded once at the end instead of per
+/// read, so a multi-byte character split across two reads is still decoded whole.
+pub(crate) fn capture_echoing<P, I, S>(program: P, args: I) -> Option<(bool, String, String)>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let program = program.as_ref();
+    let spawned = spawnable(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("could not run {}: {err}", program.to_string_lossy());
+            return None;
+        }
+    };
+    // stdout gets a thread of its own: draining one pipe to completion before starting on the other
+    // deadlocks the moment the child fills the one nobody is reading.
+    let echoing = child
+        .stdout
+        .take()
+        .map(|stream| std::thread::spawn(move || drain(stream, std::io::stdout())));
+    let errors = child.stderr.take().map(|stream| drain(stream, std::io::stderr()));
+    let output = echoing.and_then(|thread| thread.join().ok()).unwrap_or_default();
+    let status = child.wait().ok()?;
+    Some((
+        status.success(),
+        String::from_utf8_lossy(&output).into_owned(),
+        String::from_utf8_lossy(&errors.unwrap_or_default()).into_owned(),
+    ))
+}
+
+/// Copy `source` to `sink` as it arrives, keeping a copy of everything that passed through.
+///
+/// Flushed per read, which is what puts the child's output on the terminal in step with the child
+/// rather than in one burst when it exits. A read error ends the copy rather than failing the run:
+/// whatever arrived is still worth returning, and the exit status is the real verdict.
+fn drain(mut source: impl Read, mut sink: impl Write) -> Vec<u8> {
+    let mut everything = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) | Err(_) => return everything,
+            Ok(read) => {
+                let _ = sink.write_all(&buffer[..read]);
+                let _ = sink.flush();
+                everything.extend_from_slice(&buffer[..read]);
+            }
+        }
+    }
 }
 
 /// Run `program`, capturing BOTH streams — for callers that must read the failure text before

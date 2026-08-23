@@ -105,7 +105,22 @@ pub(crate) fn download_collection(url: &str, into: &Path, env: Env) -> Option<i3
     // The collection's own numbering, when it has one. Page order is only the fallback.
     let numbering = naming::sequence(&scan.page, &siblings);
     match &numbering {
-        Some(found) => println!("numbering them by {}", found.source),
+        Some(found) => {
+            println!("numbering them by {}", found.source);
+            // A name that says "episode" twice was read by its smallest number. That is the
+            // better guess — a count within a season cannot exceed the count within the series
+            // containing it — but it IS a guess, and a silently wrong episode number is the kind
+            // of mistake nobody goes looking for.
+            for name in &found.ambiguous {
+                eprintln!(
+                    "{}",
+                    style::problematic(&format!(
+                        "vidl: `{name}` names an episode more than once — took the smallest \
+                         number; check this one's prefix"
+                    ))
+                );
+            }
+        }
         None => println!("their names carry no sequence — numbering them in page order"),
     }
     let labels = numbering.as_ref().map(|found| found.prefixes.as_slice());
@@ -352,7 +367,7 @@ fn id_runs(text: &str) -> Vec<(usize, &str)> {
 /// 3. **The site's domain**, so a folder always says where its contents came from.
 ///
 /// The page's own identifier is the suffix in every case. So the worst outcome is still
-/// `site.example[2025881]`: a source and an id, which is enough to find the page again.
+/// `site.example[9001234]`: a source and an id, which is enough to find the page again.
 fn collection_dir(url: &str, page: &str, ids: &[String]) -> String {
     let id = page_id(url);
     let described = naming::shared_opening(page, ids)
@@ -392,9 +407,9 @@ mod tests {
     /// featured entry a second time. Synthetic — the real page's text is its own.
     fn episode_page(ids: &[&str]) -> String {
         let mut page = String::from("<html><head><title> Some Series, Season 6 </title></head>");
-        page.push_str(r#"<script>{"playerConfig":{"partnerId":2748741,"#);
+        page.push_str(r#"<script>{"playerConfig":{"partnerId":1234567,"#);
         page.push_str(&format!(
-            r#""url":"https://cdnapi.kaltura.com/p/2748741/sp/274874100/x","entryId":"{}"}},"#,
+            r#""url":"https://cdnapi.kaltura.com/p/1234567/sp/123456700/x","entryId":"{}"}},"#,
             ids[0]
         ));
         page.push_str(r#""items":["#);
@@ -409,7 +424,7 @@ mod tests {
 
     #[test]
     fn the_featured_video_and_its_siblings_come_back_once_each_in_page_order() {
-        let ids = ["1_8jx8mama", "1_kmayywon", "1_7ot11uev", "1_zh173l2l"];
+        let ids = ["1_a1b2c3d4", "1_e5f6g7h8", "1_y5z6a7b8", "1_u1v2w3x4"];
         let page = episode_page(&ids);
         let platform = platforms::claiming(ids[0]).expect("a Kaltura id");
         let found = siblings(&page, platform, ids[0]);
@@ -422,11 +437,11 @@ mod tests {
     fn the_scan_ignores_everything_that_is_not_an_id_of_the_resolved_shape() {
         // The precision claim: the sub-partner id, the partner id, and the surrounding JSON keys
         // all sit right beside the ids and none of them may be swept up.
-        let page = episode_page(&["1_8jx8mama", "1_kmayywon"]);
-        let platform = platforms::claiming("1_8jx8mama").unwrap();
-        let found = siblings(&page, platform, "1_8jx8mama");
+        let page = episode_page(&["1_a1b2c3d4", "1_e5f6g7h8"]);
+        let platform = platforms::claiming("1_a1b2c3d4").unwrap();
+        let found = siblings(&page, platform, "1_a1b2c3d4");
         assert_eq!(found.len(), 2, "exactly the two ids: {found:?}");
-        for noise in ["2748741", "274874100", "entryId", "partnerId", "description"] {
+        for noise in ["1234567", "123456700", "entryId", "partnerId", "description"] {
             assert!(!found.iter().any(|id| id == noise), "{noise} was swept up");
         }
     }
@@ -436,11 +451,11 @@ mod tests {
         // The false positive that cost a failed download: a player URL carrying a widget id of
         // exactly an entry id's shape. Shape alone collects it; the key it is written under is
         // what tells them apart. Both forms below are the ones seen in the wild.
-        let page = "player.html?wid=1_l0m5kgl7&entry_id=1_9gzouybz&entry_id=1_aaaaaaaa";
-        let platform = platforms::claiming("1_9gzouybz").unwrap();
-        let found = siblings(page, platform, "1_9gzouybz");
-        assert_eq!(found, ["1_9gzouybz", "1_aaaaaaaa"], "only the entry_id ones: {found:?}");
-        assert!(!found.iter().any(|id| id == "1_l0m5kgl7"), "the widget id must not be collected");
+        let page = "player.html?wid=1_q7r8s9t0&entry_id=1_i9j0k1l2&entry_id=1_aaaaaaaa";
+        let platform = platforms::claiming("1_i9j0k1l2").unwrap();
+        let found = siblings(page, platform, "1_i9j0k1l2");
+        assert_eq!(found, ["1_i9j0k1l2", "1_aaaaaaaa"], "only the entry_id ones: {found:?}");
+        assert!(!found.iter().any(|id| id == "1_q7r8s9t0"), "the widget id must not be collected");
     }
 
     #[test]
@@ -448,9 +463,9 @@ mod tests {
         // A sweep that finds too much is recoverable — a failed download and a ledger line. One
         // that finds nothing is the feature not working. So an id sitting bare, with nothing
         // identifier-shaped before it, must not filter every sibling away.
-        let page = r#"["1_9gzouybz","1_aaaaaaaa"] and entry_id=1_bbbbbbbb"#;
-        let platform = platforms::claiming("1_9gzouybz").unwrap();
-        let found = siblings(page, platform, "1_9gzouybz");
+        let page = r#"["1_i9j0k1l2","1_aaaaaaaa"] and entry_id=1_bbbbbbbb"#;
+        let platform = platforms::claiming("1_i9j0k1l2").unwrap();
+        let found = siblings(page, platform, "1_i9j0k1l2");
         assert_eq!(found.len(), 3, "no anchor key, so no filtering: {found:?}");
     }
 
@@ -474,16 +489,16 @@ mod tests {
     fn a_page_with_one_video_is_not_a_collection() {
         // The promise of the flag: a page that already works must come back as "not mine", so the
         // caller downloads it exactly as it did before.
-        let page = episode_page(&["1_8jx8mama"]);
-        let platform = platforms::claiming("1_8jx8mama").unwrap();
-        assert_eq!(siblings(&page, platform, "1_8jx8mama").len(), 1);
+        let page = episode_page(&["1_a1b2c3d4"]);
+        let platform = platforms::claiming("1_a1b2c3d4").unwrap();
+        assert_eq!(siblings(&page, platform, "1_a1b2c3d4").len(), 1);
         assert!(1 < COLLECTION_MINIMUM, "one video is below the threshold");
     }
 
     #[test]
     fn the_collection_folder_is_named_for_the_page_and_falls_back_to_its_id() {
-        let url = "https://broadcaster.example/allshows/series/69/season/6/2025881/";
-        assert_eq!(page_id(url), "2025881", "the last path segment, trailing slash and all");
+        let url = "https://broadcaster.example/shows/series/12/season/3/9001234/";
+        assert_eq!(page_id(url), "9001234", "the last path segment, trailing slash and all");
         assert_eq!(page_id("https://x.test/a/b?c=d#e"), "b", "query and fragment are not the id");
         assert_eq!(page_id("https://x.test/"), "x.test", "with no path, the host will do");
 
@@ -494,23 +509,23 @@ mod tests {
         // perfectly good-looking `<title>`. On the real page that title is the *featured episode*,
         // which is the whole reason it must not be preferred.
         let listed = episode_page(&["1_aaaaaaaa", "1_bbbbbbbb"]);
-        assert_eq!(collection_dir(url, &listed, &ids), "Episode[2025881]");
+        assert_eq!(collection_dir(url, &listed, &ids), "Episode[9001234]");
 
         // Layer 2: with nothing shared among the videos, the page title is the best there is.
         let unrelated = "<html><head><title>A Whole Season</title></head>\
                          <body>{\"title\":\"Alpha\",\"entryId\":\"1_aaaaaaaa\"}\
                          {\"title\":\"Zulu\",\"entryId\":\"1_bbbbbbbb\"}</body></html>";
-        assert_eq!(collection_dir(url, unrelated, &ids), "A Whole Season[2025881]");
+        assert_eq!(collection_dir(url, unrelated, &ids), "A Whole Season[9001234]");
 
         // Layer 3: nothing shared and no title, so the folder at least says where it came from.
         let bare = "<html>{\"title\":\"Alpha\",\"entryId\":\"1_aaaaaaaa\"}\
                     {\"title\":\"Zulu\",\"entryId\":\"1_bbbbbbbb\"}</html>";
-        assert_eq!(collection_dir(url, bare, &ids), "broadcaster.example[2025881]");
+        assert_eq!(collection_dir(url, bare, &ids), "broadcaster.example[9001234]");
 
         // And the identifier is the suffix in every case, so the worst outcome is still a source
         // and an id — enough to find the page again.
         for page in [listed.as_str(), unrelated, bare] {
-            assert!(collection_dir(url, page, &ids).ends_with("[2025881]"), "{page:.40}");
+            assert!(collection_dir(url, page, &ids).ends_with("[9001234]"), "{page:.40}");
         }
     }
 
@@ -586,8 +601,8 @@ mod tests {
         // sibling count. These are the real file names yt-dlp produced for two different sites.
         let dir = scratch_dir("page_dumps");
         let page = "lecture-05sep2017_https_-_www.cns.nyu.edu_~eero_math-tools17_Videos_x.dump";
-        let api = "1_9gzouybz_dde13be2610b0773875b15718fb75705_http_-_cdnapi.kaltura.com_api.dump";
-        let manifest = "1_9gzouybz_http_-_cdnapi.kaltura.com_p_1674401_playManifest.dump";
+        let api = "1_i9j0k1l2_dde13be2610b0773875b15718fb75705_http_-_cdnapi.kaltura.com_api.dump";
+        let manifest = "1_i9j0k1l2_http_-_cdnapi.kaltura.com_p_1674401_playManifest.dump";
         // Deliberately the sizes that broke the first version: the API reply is the biggest file.
         std::fs::write(dir.join(page), "the page".repeat(20)).unwrap();
         std::fs::write(dir.join(api), "an api reply".repeat(200)).unwrap();
@@ -605,7 +620,7 @@ mod tests {
 
     #[test]
     fn the_host_is_read_off_a_url_the_way_a_dump_name_carries_it() {
-        assert_eq!(host_of("https://broadcaster.example/allshows/series/69/"), "broadcaster.example");
+        assert_eq!(host_of("https://broadcaster.example/shows/series/12/"), "broadcaster.example");
         assert_eq!(host_of("https://www.cns.nyu.edu/~eero/x.html"), "www.cns.nyu.edu");
         assert_eq!(host_of("http://user:pw@media.example.com/v/1"), "media.example.com");
         assert_eq!(host_of("https://x.test?a=b"), "x.test");

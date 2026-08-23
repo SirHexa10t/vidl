@@ -58,7 +58,7 @@ pub(crate) fn names() -> Vec<&'static str> {
 }
 
 /// A Kaltura entry id: a single digit, an underscore, then eight to twelve lowercase alphanumerics
-/// (`1_8jx8mama`). Deliberately narrow — this shape is also what finds the siblings, so a loose
+/// (`1_a1b2c3d4`). Deliberately narrow — this shape is also what finds the siblings, so a loose
 /// pattern would sweep in every other underscore-joined token on the page.
 fn kaltura_claims(id: &str) -> bool {
     let mut chars = id.chars();
@@ -111,16 +111,16 @@ mod tests {
 
     #[test]
     fn a_kaltura_entry_id_is_recognised_and_a_look_alike_token_is_not() {
-        // The real shape, from the page that prompted this.
-        assert!(kaltura_claims("1_8jx8mama"));
+        // The real shape (the ids themselves invented, here and throughout).
+        assert!(kaltura_claims("1_a1b2c3d4"));
         assert!(kaltura_claims("0_abcd1234"));
         assert!(kaltura_claims("1_abcdefghijkl"), "twelve trailing characters is still one");
         // The pattern doubles as the sibling finder, so everything it must NOT sweep up off a
         // page: bare numbers, ids without the digit prefix, mixed case, wrong length.
         for not_an_id in [
-            "274874100",     // the sub-partner id, all digits
-            "sp_274874100",  // an underscore-joined token that doesn't start with a digit
-            "1_8JX8MAMA",    // upper case
+            "123456700",     // the sub-partner id, all digits
+            "sp_123456700",  // an underscore-joined token that doesn't start with a digit
+            "1_A1B2C3D4",    // upper case
             "1_short",       // too few trailing characters
             "1_abcdefghijklm", // too many
             "1_",
@@ -133,28 +133,28 @@ mod tests {
 
     #[test]
     fn the_partner_id_is_taken_from_a_kaltura_host_and_not_from_the_page_itself() {
-        // The shape it appears in on a real page: the player script's own URL.
-        let page = r#"<script src="https://cdnapisec.kaltura.com/p/2748741/embedPlaykitJs/x">"#;
+        // Where it really appears — the player script's own URL — with invented numbers.
+        let page = r#"<script src="https://cdnapisec.kaltura.com/p/1234567/embedPlaykitJs/x">"#;
         assert_eq!(
-            kaltura_address("1_kmayywon", page).as_deref(),
-            Some("kaltura:2748741:1_kmayywon")
+            kaltura_address("1_e5f6g7h8", page).as_deref(),
+            Some("kaltura:1234567:1_e5f6g7h8")
         );
 
         // The bug this cost: the page that prompted the feature declares a *different* partner id
         // as its own and repeats it in every image path, and that one is rejected by Kaltura. The
         // count is no guide and neither is the declaration — only the host is.
-        let two = r#"{"partner_id":"5031"} <img src="https://cdn.site.test/image/p/5031/a.jpg">
-                     <img src="https://cdn.site.test/image/p/5031/b.jpg">
-                     <script src="https://cdnapisec.kaltura.com/p/2748741/embedPlaykitJs/x">"#;
+        let two = r#"{"partner_id":"8642"} <img src="https://cdn.site.test/image/p/8642/a.jpg">
+                     <img src="https://cdn.site.test/image/p/8642/b.jpg">
+                     <script src="https://cdnapisec.kaltura.com/p/1234567/embedPlaykitJs/x">"#;
         assert_eq!(
             kaltura_address("1_x", two).as_deref(),
-            Some("kaltura:2748741:1_x"),
+            Some("kaltura:1234567:1_x"),
             "the site's own account must not win on frequency or on being declared"
         );
 
         // Nothing on a Kaltura host means nothing is claimed: the siblings are found but reported
         // unreachable rather than addressed to a guessed account.
-        assert!(kaltura_address("1_x", r#"{"partner_id":"5031"} /p/5031/a"#).is_none());
+        assert!(kaltura_address("1_x", r#"{"partner_id":"8642"} /p/8642/a"#).is_none());
         assert!(kaltura_address("1_x", "no partner anywhere").is_none());
         // A marker with no digits after it must not be mistaken for one; the scan keeps looking.
         assert_eq!(
@@ -172,12 +172,12 @@ mod tests {
         }
         // `claiming` must be unambiguous: two platforms claiming one id would make the sibling
         // sweep depend on table order.
-        let ids = ["1_8jx8mama", "0_abcd1234"];
+        let ids = ["1_a1b2c3d4", "0_abcd1234"];
         for id in ids {
             let claims = PLATFORMS.iter().filter(|p| (p.claims)(id)).count();
             assert!(claims <= 1, "{id} is claimed by {claims} platforms");
         }
-        assert_eq!(claiming("1_8jx8mama").map(|p| p.name), Some("Kaltura"));
+        assert_eq!(claiming("1_a1b2c3d4").map(|p| p.name), Some("Kaltura"));
         assert!(claiming("dQw4w9WgXcQ").is_none(), "a YouTube id is nobody's business here");
     }
 }

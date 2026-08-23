@@ -165,7 +165,7 @@ vidl::tools::install(vidl::tools::Tools {
   platform (Kaltura today). One entry serves every site embedding that platform, but a page using an
   unlisted one has its siblings reported as unreachable rather than guessed at. The table stays
   small for a reason: because videos are found *by id shape*, a platform only qualifies if its ids
-  can be told apart from ordinary page text. Kaltura's can (`1_8jx8mama`); Brightcove's are plain
+  can be told apart from ordinary page text. Kaltura's can (`1_a1b2c3d4`); Brightcove's are plain
   digits and JW Player's are bare alphanumerics, so neither could be swept for without matching
   half the page.
 - **No PO-token provider.** yt-dlp's strongest answer to bot-walling isn't wired up; the failure

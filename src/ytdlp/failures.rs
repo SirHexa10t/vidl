@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use crate::util::exec::capture_output;
+use crate::util::exec::{capture_echoing, capture_output};
 use crate::util::size::roughly;
 use super::{ARCHIVE_NAME, names, ytdlp_invocation};
 use super::scan::{archived_ids};
@@ -50,6 +50,10 @@ enum Failure {
     /// The filesystem refused the name, not the site. Local, and so the one failure here that no
     /// cookie, region or retry can help with.
     NameTooLong,
+    /// The chosen format is not on the server — a transcode that failed or was purged, which a CDN
+    /// reports as a 404 on the *media* rather than on the page. Other formats of the same video are
+    /// usually fine, so this is a failure about one rendition, not about the video.
+    FormatMissing,
     /// A resume asked for bytes the server does not have. Caused by a leftover `.part` at least as
     /// long as the remote file — the shape an interrupt leaves when it lands after the last byte
     /// but before the rename. Local in origin like [`Failure::NameTooLong`], and likewise immune
@@ -80,6 +84,13 @@ fn classify_failure(stderr: &str) -> Failure {
     // "416", which would happily match a video id or a title.
     } else if has("range not satisfiable") || has("error 416") {
         Failure::RangeRefused
+    // Keyed on yt-dlp's *media* phrasing, not on the bare code. `unable to download video data:
+    // HTTP Error 404` is one rendition missing and another may serve; `Unable to download webpage:
+    // HTTP Error 404` is the video itself gone, where checking formats would only waste requests.
+    // 404 and not 403: a 404 says the file is not there, which is what a missing transcode gives,
+    // where a 403 is an access problem with its own honest reporting further down.
+    } else if has("video data") && has("404") {
+        Failure::FormatMissing
     } else if has("in your country") || has("from your location") || has("in your region") || has("geo restrict") || has("geo_restrict") {
         Failure::Geo
     } else if has("not a bot") || has("captcha") || has("unusual traffic") || has("solve js challenge") || has("challenge data") || has("verify you are human") || has("verify you're human") {
@@ -118,6 +129,37 @@ fn restarting(base: &[OsString]) -> Option<Vec<OsString>> {
     Some(fresh)
 }
 
+/// The same download, told to prove a format downloads before committing to it.
+///
+/// `None` when the argv already says so — the check has been made and the answer was no.
+///
+/// Only ever used on a *retry*. `--check-formats` costs a request per candidate format, which is
+/// nothing against one broken video and a great deal against a collection of healthy ones.
+fn checking_formats(base: &[OsString]) -> Option<Vec<OsString>> {
+    if base.iter().any(|arg| arg == "--check-formats" || arg == "--check-all-formats") {
+        return None;
+    }
+    let mut checked = base.to_vec();
+    checked.push("--check-formats".into());
+    Some(checked)
+}
+
+/// What to record when no format of a video could be downloaded.
+///
+/// Distinguished from "the video is gone" on purpose: the page served a format list, so the video
+/// exists as far as the site is concerned — it is the media behind every entry in that list that is
+/// missing, which is a fault at the origin and may well be repaired later. So the entry stays out
+/// of the archive and a future run tries again.
+fn format_missing_line(label: &str, checked: bool) -> String {
+    let tail = if checked {
+        "none of the formats it offers can be downloaded — the site lists them but the files are \
+         missing at its end, so this is worth retrying another day"
+    } else {
+        "the format it offers cannot be downloaded, and the formats had already been checked"
+    };
+    format!("{label} — {tail}")
+}
+
 /// The offset a refused resume was going to continue from, read back out of yt-dlp's own report of
 /// it (`[download] Resuming download at byte 749233884`).
 ///
@@ -141,12 +183,19 @@ fn resumed_at(output: &str) -> Option<u64> {
 /// Two facts, both needed: the range refusal is why the run looked odd, and the second error is
 /// why it still failed. Naming only the first would send the user after a `.part` the restart has
 /// already consumed.
-fn restarted_into_line(label: &str, detail: &str) -> String {
-    format!(
-        "{label} — the partial file could not be resumed (the server refused the byte range), so it \
-         was started over; that got past the leftover file and then failed: {detail}"
-    )
+fn rescued_into_line(label: &str, rescue: &str, detail: &str) -> String {
+    format!("{label} — {rescue}, and then failed: {detail}")
 }
+
+/// What a rescue did, for [`rescued_into_line`] — phrased to be read before "and then failed".
+const RESTARTED: &str =
+    "the partial file could not be resumed (the server refused the byte range), so it was started \
+     over; that got past the leftover file";
+
+/// See [`RESTARTED`].
+const CHECKED_FORMATS: &str =
+    "the chosen format was missing from the server, so every format was checked before use; that \
+     found one that downloads";
 
 /// What to record when a refused resume could not be rescued.
 ///
@@ -193,6 +242,17 @@ pub(crate) fn capture_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String
     capture_output(program, args)
 }
 
+/// [`capture_ytdlp`], but with the child's output passed through to the user as it happens.
+///
+/// Every attempt [`diagnose_failure`] makes goes through here rather than the silent version. A
+/// retry is a download: it can take minutes, and the only thing worse than waiting for it is
+/// waiting for it with nothing on screen. The captured text is still what decides the verdict — the
+/// echo is a copy, not a substitute.
+fn retry_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String)> {
+    let (program, args) = ytdlp_invocation(argv);
+    capture_echoing(program, args)
+}
+
 /// Re-run a failed download with output captured to learn WHY (group runs stream live and keep no
 /// stderr) and return the ledger line for whatever stays dead (`None` when a retry succeeded).
 /// A geo-block is handled per `rescue`: [`GeoRescue::XffSweep`] walks [`XFF_REGIONS`] for sites
@@ -201,7 +261,10 @@ pub(crate) fn capture_ytdlp(argv: Vec<OsString>) -> Option<(bool, String, String
 /// failure is also announced on stderr as it's decided, so the reason shows in the run's output —
 /// not only later in the ledger.
 pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoRescue) -> Option<String> {
-    let Some((ok, stdout, stderr)) = capture_ytdlp(base.clone()) else {
+    // Said before the attempt, not after it. Now that a retry's output reaches the screen, an
+    // unannounced one looks like the same error happening twice for no reason.
+    println!("{label}: asking once more before diagnosing");
+    let Some((ok, stdout, stderr)) = retry_ytdlp(base.clone()) else {
         return Some(dead(format!("{label} — failed (could not even re-run yt-dlp)")));
     };
     if ok {
@@ -220,7 +283,7 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
                     let mut spoofed = base.clone();
                     spoofed.push("--xff".into());
                     spoofed.push((*region).into());
-                    if matches!(capture_ytdlp(spoofed), Some((true, _, _))) {
+                    if matches!(retry_ytdlp(spoofed), Some((true, _, _))) {
                         println!("{label}: region {region} worked");
                         return None;
                     }
@@ -250,7 +313,7 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
             if let Some(shorter) = names::halve_title_bound(&base) {
                 println!("{label}: the file name was refused — retrying with a shorter one");
                 tried_shorter = true;
-                if matches!(capture_ytdlp(shorter), Some((true, _, _))) {
+                if matches!(retry_ytdlp(shorter), Some((true, _, _))) {
                     println!("{label}: succeeded with a shortened name");
                     return None;
                 }
@@ -274,7 +337,7 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
                     .unwrap_or_default();
                 println!("{label}: the partial file cannot be resumed — starting it over{spend}");
                 restarted = true;
-                match capture_ytdlp(fresh) {
+                match retry_ytdlp(fresh) {
                     Some((true, _, _)) => {
                         println!("{label}: succeeded after starting the file over");
                         return None;
@@ -283,12 +346,38 @@ pub(crate) fn diagnose_failure(base: Vec<OsString>, label: &str, rescue: GeoResc
                     // the advice below would send the user to delete a `.part` that is no longer
                     // there, and blame the range for a failure that has nothing to do with it.
                     Some((false, _, again)) if classify_failure(&again) != Failure::RangeRefused => {
-                        return Some(dead(restarted_into_line(label, error_line(&again))));
+                        return Some(dead(rescued_into_line(label, RESTARTED, error_line(&again))));
                     }
                     _ => {}
                 }
             }
             Some(dead(range_refused_line(label, restarted)))
+        }
+        // The format yt-dlp ranked highest is not on the server. Ranking is done on the metadata
+        // the page advertises, which says nothing about whether the file behind it exists — so the
+        // rescue is to make yt-dlp *check* each candidate and take the first that answers. Seen in
+        // the wild: a Kaltura entry whose three progressive MP4 flavours all 404 while all three of
+        // its HLS renditions serve, the MP4s ranking higher only because HLS reports its codecs as
+        // unknown.
+        Failure::FormatMissing => {
+            let mut checked = false;
+            if let Some(probing) = checking_formats(&base) {
+                println!("{label}: the chosen format is missing from the server — trying the others");
+                checked = true;
+                match retry_ytdlp(probing) {
+                    Some((true, _, _)) => {
+                        println!("{label}: succeeded on another format");
+                        return None;
+                    }
+                    // Checking found a servable format and the download failed for some other
+                    // reason; blaming the formats would send the user looking in the wrong place.
+                    Some((false, _, again)) if classify_failure(&again) != Failure::FormatMissing => {
+                        return Some(dead(rescued_into_line(label, CHECKED_FORMATS, error_line(&again))));
+                    }
+                    _ => {}
+                }
+            }
+            Some(dead(format_missing_line(label, checked)))
         }
         Failure::Other => Some(dead(other_line(label, error_line(&stderr)))),
     }
@@ -547,6 +636,65 @@ mod tests {
         // don't mislabel it as a bot-wall.
         assert_eq!(classify_failure("ERROR: HTTP Error 403: Forbidden"), Failure::Other);
         assert_eq!(XFF_REGIONS.len(), 12, "a dozen regions, as specified");
+    }
+
+    #[test]
+    fn a_missing_rendition_is_told_apart_from_a_missing_video() {
+        // The real message, for a format the site lists but cannot serve.
+        assert_eq!(
+            classify_failure("ERROR: unable to download video data: HTTP Error 404: Not Found"),
+            Failure::FormatMissing
+        );
+        // A 404 on the PAGE is the video itself gone. Checking formats cannot help — there are none
+        // — so it must not be classified here, or every dead link costs a round of probes.
+        assert_eq!(
+            classify_failure("ERROR: [generic] x: Unable to download webpage: HTTP Error 404: Not Found"),
+            Failure::Other
+        );
+        // And a 403 on the media is an access problem, not an absent file. It keeps the `Other`
+        // reporting, which has the advice worth giving for a block.
+        assert_eq!(
+            classify_failure("ERROR: unable to download video data: HTTP Error 403: Forbidden"),
+            Failure::Other
+        );
+    }
+
+    #[test]
+    fn checking_formats_is_offered_once_and_then_admitted_to_be_exhausted() {
+        let base: Vec<OsString> =
+            ["-o", "x.mp4", "https://example.com/v"].iter().map(OsString::from).collect();
+        let probing = checking_formats(&base).expect("a first check is available");
+        assert_eq!(probing.last().expect("an argument"), "--check-formats");
+        assert_eq!(probing.len(), base.len() + 1, "nothing else is disturbed");
+        // Asked again on a command that already checked, there is nothing left to try.
+        assert!(checking_formats(&probing).is_none(), "no second check");
+        // `--check-all-formats` counts as having checked: it is the stronger form of the same ask.
+        let mut thorough = base.clone();
+        thorough.push("--check-all-formats".into());
+        assert!(checking_formats(&thorough).is_none(), "the stronger flag counts too");
+    }
+
+    #[test]
+    fn an_unservable_video_is_recorded_as_worth_retrying_rather_than_gone() {
+        // The distinction that matters for the archive: the site still lists the video, so this is
+        // its fault and it may fix it. The entry stays unarchived and a future run tries again.
+        let exhausted = format_missing_line("clip", true);
+        assert!(exhausted.contains("none of the formats"), "{exhausted}");
+        assert!(exhausted.contains("retrying another day"), "not reported as gone: {exhausted}");
+        // The branch reachable only from a caller that had already checked must not claim a check.
+        let already = format_missing_line("clip", false);
+        assert!(!already.contains("none of the formats"), "{already}");
+        assert!(already.contains("already been checked"), "{already}");
+    }
+
+    #[test]
+    fn a_rescue_that_worked_and_then_failed_names_both_facts() {
+        // Shared by the two rescues, so their reports read the same way: what was got past, and
+        // what stopped it anyway.
+        let line = rescued_into_line("clip", CHECKED_FORMATS, "ERROR: ffmpeg not found");
+        assert!(line.starts_with("clip — the chosen format was missing"), "{line}");
+        assert!(line.contains("and then failed: ERROR: ffmpeg not found"), "{line}");
+        assert!(rescued_into_line("clip", RESTARTED, "x").contains("byte range"), "both read alike");
     }
 
     #[test]

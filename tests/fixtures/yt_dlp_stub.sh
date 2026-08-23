@@ -24,6 +24,8 @@
 #                     .part is already as long as the remote file, until told --no-continue
 #     range_refused_then_other  the same refusal, but the restart hits an unrelated error —
 #                     observed for real when ffmpeg was missing
+#     format_missing_unless_checked  the media 404 a CDN gives for a transcode that is listed but
+#                     absent, until --check-formats makes yt-dlp pick a servable one
 #
 # Probe invocations (--print) always succeed: --flat-playlist replays scan.txt, a
 # --playlist-items probe replays probe.txt, and a lone-video probe prints video_probe.txt when
@@ -205,6 +207,14 @@ case "${VIDL_STUB_MODE:-ok}" in
         fi
         echo "[download] Resuming download at byte 749233884"
         echo "ERROR: unable to download video data: HTTP Error 416: Requested Range Not Satisfiable" >&2
+        exit 1 ;;
+    format_missing_unless_checked)
+        # The highest-ranked format is listed by the site but missing at its origin, so the media
+        # 404s while the video itself is fine. Keyed on the ARGV, like the other rescues: a plain
+        # re-run asks for the same dead file and gets the same answer, and only a request that
+        # checks before committing gets through.
+        if [[ "$args" == *" --check-formats "* ]]; then succeed; fi
+        echo "ERROR: unable to download video data: HTTP Error 404: Not Found" >&2
         exit 1 ;;
     *)
         echo "yt-dlp stub: unknown VIDL_STUB_MODE '${VIDL_STUB_MODE}'" >&2

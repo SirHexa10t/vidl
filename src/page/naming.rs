@@ -91,12 +91,27 @@ fn guessed_sequence(values: &[&str]) -> Option<Numbering> {
     if numbers.len() != values.len() {
         return None;
     }
-    let mut sorted = numbers.clone();
-    sorted.sort_unstable();
-    sorted.windows(2).all(|pair| pair[1] == pair[0] + 1).then(|| Numbering {
+    consecutive(&numbers).then(|| Numbering {
         prefixes: padded(&numbers),
         source: "the last number in each name".to_string(),
+        ambiguous: Vec::new(),
     })
+}
+
+/// Whether `numbers`, sorted, run one to the next with no gap and no repeat.
+///
+/// Required of *every* numbering, marked or guessed. It rules out three different mistakes at once:
+/// a page's internal row ids (distinct but scattered), a repeat (which would put two files on one
+/// prefix), and a misread number — an episode listed as `Episode 15 - Episode 100` read as 100
+/// leaves a hole at 15 and a stray at 100, and the hole is what gives the misreading away.
+///
+/// A run with a genuine gap is refused too, and that is deliberate: a set of prefixes reading
+/// `E01,E05,E09` claims a completeness the page did not provide, and page order at least does not
+/// lie about what it is.
+fn consecutive(numbers: &[usize]) -> bool {
+    let mut sorted = numbers.to_vec();
+    sorted.sort_unstable();
+    sorted.windows(2).all(|pair| pair[1] == pair[0] + 1)
 }
 
 /// A collection's own numbering, and what supplied it.
@@ -109,6 +124,12 @@ pub(crate) struct Numbering {
     pub(crate) prefixes: Vec<String>,
     /// How they were arrived at, phrased to follow "numbering them by ".
     pub(crate) source: String,
+    /// Names that said "episode" more than once, so the number used was the smallest of several.
+    ///
+    /// Carried out rather than warned about in place: the search tries every language before one
+    /// wins, so warning where the ambiguity is *seen* would shout about readings that were then
+    /// discarded. Only the winner's doubts are worth the user's attention.
+    pub(crate) ambiguous: Vec<String>,
 }
 
 /// How many digits `value` needs — the width every number in a set is padded to, so `S6E01` and
@@ -134,11 +155,14 @@ fn labelled(letter: &str, numbers: &[usize]) -> Vec<String> {
 
 /// The numbers a set of names give *by name* — where each says which of its numbers is the episode.
 ///
-/// This is the trustworthy path. A name reading `Episode 5: The 3 Musketeers` has two numbers in it
-/// and only one of them is the episode; anchoring on the word is what tells them apart, where
-/// taking the last run of digits would take the stray. So no shape test is imposed on the result
-/// beyond the numbers being distinct — they don't have to prove they aren't row ids, because the
-/// name already said what they are.
+/// This is the better-evidenced path. A name reading `Episode 5: The 3 Musketeers` has two numbers
+/// in it and only one of them is the episode; anchoring on the word is what tells them apart, where
+/// taking the last run of digits would take the stray.
+///
+/// It is not, however, evidence enough to skip the shape test. A name can say "episode" twice, and
+/// a page listing `Episode 15 - Episode 100` gives its fifteenth episode a number belonging to the
+/// as a whole. So the numbers must still run consecutively, exactly as a guessed set must: the
+/// missing 15 and the stray 100 are what betray the misreading.
 ///
 /// A season, when *every* name carries one, is written into the label rather than folded into
 /// arithmetic: season 5 episode 4 becomes `S5E04`, season 5 episode 11 `S5E11`. Both parts are
@@ -152,12 +176,28 @@ fn marked_sequence(values: &[&str]) -> Option<Numbering> {
     for vocabulary in keywords::SERIES {
         // The episode comes first and nothing proceeds without it: a season on its own numbers
         // nothing, and a label reading `S4` for every video would sort them all together.
-        let found: Vec<(usize, usize)> =
+        let found: Vec<Mark> =
             values.iter().filter_map(|value| marked_span(value, vocabulary.episode)).collect();
         if found.len() != values.len() {
             continue;
         }
-        let episodes: Vec<usize> = found.iter().map(|(number, _)| *number).collect();
+        let episodes: Vec<usize> = found.iter().map(|mark| mark.number).collect();
+        // The same rule the guessed path lives by, and it used to be waived here — on the grounds
+        // that a name saying "episode" had already vouched for its number. It had not: a name can
+        // say it twice (`Episode 15 - Episode 100`, an episode counted within its season and then
+        // the whole series), and then the vouching is for the wrong number. The hole it leaves in
+        // the run is exactly the evidence, so the run is checked here too.
+        if !consecutive(&episodes) {
+            continue;
+        }
+        // Names that named an episode more than once. Reported rather than resolved: the smallest
+        // was taken, and whether that was right is a question about the page, not about this code.
+        let ambiguous: Vec<String> = values
+            .iter()
+            .zip(&found)
+            .filter(|(_, mark)| mark.others > 0)
+            .map(|(value, _)| (*value).to_string())
+            .collect();
         let named = |what: &str| format!("their {} {what} numbers", vocabulary.language);
         // Then the season, on top — from the same language, and never off the *same digits*. A name
         // shaped `<number>: <title>` has one number in it, and reading it as both parts would give
@@ -165,10 +205,10 @@ fn marked_sequence(values: &[&str]) -> Option<Numbering> {
         let seasons: Vec<usize> = values
             .iter()
             .zip(&found)
-            .filter_map(|(value, (_, episode_at))| {
+            .filter_map(|(value, episode)| {
                 marked_span(value, vocabulary.season)
-                    .filter(|(_, season_at)| season_at != episode_at)
-                    .map(|(number, _)| number)
+                    .filter(|season| season.at != episode.at)
+                    .map(|season| season.number)
             })
             .collect();
         // The episode label is built first and stands on its own; the season, when there is one,
@@ -185,12 +225,12 @@ fn marked_sequence(values: &[&str]) -> Option<Numbering> {
                 .map(|(season, episode)| format!("{season}{episode}"))
                 .collect();
             if let Some(prefixes) = all_distinct(both) {
-                return Some(Numbering { prefixes, source: named("season and episode") });
+                return Some(Numbering { prefixes, source: named("season and episode"), ambiguous });
             }
         }
         if episode_only.is_none() {
             if let Some(prefixes) = all_distinct(episode_labels) {
-                episode_only = Some(Numbering { prefixes, source: named("episode") });
+                episode_only = Some(Numbering { prefixes, source: named("episode"), ambiguous });
             }
         }
     }
@@ -198,12 +238,18 @@ fn marked_sequence(values: &[&str]) -> Option<Numbering> {
 }
 
 /// `labels` when no two are the same — two files cannot share one prefix.
+///
+/// Kept although [`consecutive`] now makes it unreachable: a run with no gap and no repeat cannot
+/// produce two equal labels. It stays because the failure it guards is a *collision*, where two
+/// downloads write to one name and one of them is lost — cheap insurance against a future relaxing
+/// of the rule above, and the only check here whose absence would destroy data rather than merely
+/// mislabel it.
 fn all_distinct(labels: Vec<String>) -> Option<Vec<String>> {
     let unique = labels.iter().collect::<HashSet<_>>().len();
     (unique == labels.len()).then_some(labels)
 }
 
-/// The number introduced by the last of `markers` that actually introduces one.
+/// The number introduced by the FIRST of `markers` that actually introduces one.
 ///
 /// A word has to sit at a boundary, and the two reading directions need that tested differently —
 /// forwards it must begin a word, backwards it must end one. Either way the *edge of the name* is a
@@ -211,14 +257,24 @@ fn all_distinct(labels: Vec<String>) -> Option<Vec<String>> {
 ///
 /// Between the word and its digits any run of space, dot, hyphen or underscore is allowed, or none
 /// at all — which is what makes `S3E12`, `Ep. 12` and `episode-12` the same thing.
-/// The number a word introduces, **and where those digits sit**.
+/// One name's mark: the number a word introduces, **where those digits sit**, and how many further
+/// marks the same name offered.
 ///
 /// The position is what lets a caller refuse to read one run of digits as two different things —
 /// see [`marked_sequence`], where a name like `期3話` would otherwise report season 3 and episode 3
 /// off the same `3`.
-fn marked_span(text: &str, markers: &[&str]) -> Option<(usize, usize)> {
+struct Mark {
+    number: usize,
+    at: usize,
+    /// Marks found after this one. Non-zero means the name named an episode more than once, which
+    /// the caller reports rather than resolves — it is a fact about the page, not an error here.
+    others: usize,
+}
+
+/// Every mark in `text`, in the order they appear.
+fn marked_spans(text: &str, markers: &[&str]) -> Vec<(usize, usize)> {
     let lower = text.to_lowercase();
-    let mut found = None;
+    let mut found = Vec::new();
     for at in lower.char_indices().map(|(at, _)| at) {
         for marker in markers {
             if !lower[at..].starts_with(marker) {
@@ -236,7 +292,7 @@ fn marked_span(text: &str, markers: &[&str]) -> Option<(usize, usize)> {
             // stop the longer word from being tried.
             if !after_letter {
                 if let Some((number, skipped)) = number_after(rest) {
-                    found = Some((number, at + marker.len() + skipped));
+                    found.push((number, at + marker.len() + skipped));
                     break;
                 }
             }
@@ -253,13 +309,34 @@ fn marked_span(text: &str, markers: &[&str]) -> Option<(usize, usize)> {
             // season. The leading boundary needs no test here: what precedes is a digit.
             if !marker.is_ascii() && (spaceless(marker) || !before_letter) {
                 if let Some((number, start)) = number_before(&lower[..at]) {
-                    found = Some((number, start));
+                    found.push((number, start));
                     break;
                 }
             }
         }
     }
     found
+}
+
+/// The SMALLEST mark in `text`, carrying how many others there were.
+///
+/// The case this exists for: `Episode 15 - Episode 100` — a page numbering an
+/// episode within its season *and* again within the whole series. Reading the last mark reported
+/// 100, which then sat in the sequence where 15 belonged.
+///
+/// Smallest rather than earliest, though either would answer that page. Position is a bet on a
+/// writing convention, and conventions differ — `Episode 100 - Episode 15` is the same fact in
+/// the other order. Magnitude is a bet on what the numbers *mean*, and the two meanings are not
+/// symmetric: a count within a season cannot exceed the count within the series that contains it.
+/// So the smaller number is the more local index, whichever end of the name it sits at.
+///
+/// The same reasoning covers seasons, which is why one rule serves both: where a name offers two,
+/// the smaller is the more likely to be this page's own.
+fn marked_span(text: &str, markers: &[&str]) -> Option<Mark> {
+    let spans = marked_spans(text, markers);
+    // Ties keep the earlier — with equal numbers there is nothing to choose between them.
+    let (number, at) = *spans.iter().min_by_key(|(number, _)| *number)?;
+    Some(Mark { number, at, others: spans.len() - 1 })
 }
 
 /// Whether `word` is written in a script that runs without spaces, so there is no word end for a
@@ -621,7 +698,7 @@ mod tests {
 
     /// Just the number a word introduces, dropping where its digits sat.
     fn marked_number(text: &str, markers: &[&str]) -> Option<usize> {
-        marked_span(text, markers).map(|(number, _)| number)
+        marked_span(text, markers).map(|mark| mark.number)
     }
 
     /// One language's words, by name — for exercising `marked_number` on its own.
@@ -695,18 +772,18 @@ mod tests {
         // either side of its digits.
         let ids = ["1_aaaaaaaa", "1_bbbbbbbb"];
         for (language, first, second) in [
-            ("English", "Season 3, Episode 12", "Season 3, Episode 2"),
-            ("Spanish", "Temporada 3, Episodio 12", "Temporada 3, Episodio 2"),
-            ("French", "Saison 3, Épisode 12", "Saison 3, Épisode 2"),
-            ("Italian", "Stagione 3, Episodio 12", "Stagione 3, Episodio 2"),
-            ("Russian", "Сезон 3, Серия 12", "Сезон 3, Серия 2"),
-            ("Hebrew", "עונה 3, פרק 12", "עונה 3, פרק 2"),
-            ("Japanese", "第3期第12話", "第3期第2話"),
-            ("Chinese", "第3季第12集", "第3季第2集"),
-            ("shorthand", "S03E12", "S03E02"),
+            ("English", "Season 3, Episode 12", "Season 3, Episode 11"),
+            ("Spanish", "Temporada 3, Episodio 12", "Temporada 3, Episodio 11"),
+            ("French", "Saison 3, Épisode 12", "Saison 3, Épisode 11"),
+            ("Italian", "Stagione 3, Episodio 12", "Stagione 3, Episodio 11"),
+            ("Russian", "Сезон 3, Серия 12", "Сезон 3, Серия 11"),
+            ("Hebrew", "עונה 3, פרק 12", "עונה 3, פרק 11"),
+            ("Japanese", "第3期第12話", "第3期第11話"),
+            ("Chinese", "第3季第12集", "第3季第11集"),
+            ("shorthand", "S03E12", "S03E11"),
         ] {
             let page = episodes(&[first, second], &ids);
-            assert_eq!(labels(&page, &ids).as_deref(), Some("S3E12,S3E02"), "{language}: {first}");
+            assert_eq!(labels(&page, &ids).as_deref(), Some("S3E12,S3E11"), "{language}: {first}");
         }
     }
 
@@ -729,26 +806,26 @@ mod tests {
         // A Spanish season beside an English episode is a name nobody wrote, and reading it that
         // way would invent a number. The episode alone is the honest answer.
         let ids = ["1_aaaaaaaa", "1_bbbbbbbb"];
-        let mixed = episodes(&["Temporada 3, Episode 12", "Temporada 3, Episode 2"], &ids);
-        assert_eq!(labels(&mixed, &ids).as_deref(), Some("E12,E02"), "no season from two languages");
+        let mixed = episodes(&["Temporada 3, Episode 12", "Temporada 3, Episode 11"], &ids);
+        assert_eq!(labels(&mixed, &ids).as_deref(), Some("E12,E11"), "no season from two languages");
     }
 
     #[test]
     fn a_collection_with_no_season_named_is_numbered_by_its_episodes_alone() {
-        // The season is optional throughout, and this is what its absence produces: bare padded
-        // episode numbers, with no `E` and nothing invented in place of the season.
+        // The season is optional throughout, and this is what its absence produces: padded episode
+        // numbers, with no `S` and nothing invented in place of the season.
         let ids = ["1_aaaaaaaa", "1_bbbbbbbb", "1_cccccccc"];
-        let page = episodes(&["Episode 3", "Episode 12", "Episode 7"], &ids);
+        let page = episodes(&["Episode 11", "Episode 12", "Episode 10"], &ids);
         let found = sequence(&page, &owned(&ids)).expect("episodes alone are enough");
-        assert_eq!(found.prefixes, ["E03", "E12", "E07"], "the episode label stands alone");
+        assert_eq!(found.prefixes, ["E11", "E12", "E10"], "the episode label stands alone");
         // And the run says so: the source names the episode and does not claim a season.
         assert!(found.source.contains("episode"), "{}", found.source);
         assert!(!found.source.contains("season"), "nothing to say about seasons: {}", found.source);
 
         // With a season named, the same names gain the other half — this is the contrast.
-        let seasoned = episodes(&["Season 4, Episode 3", "Season 4, Episode 12"], &ids[..2]);
+        let seasoned = episodes(&["Season 4, Episode 11", "Season 4, Episode 12"], &ids[..2]);
         let found = sequence(&seasoned, &owned(&ids[..2])).expect("both parts");
-        assert_eq!(found.prefixes, ["S4E03", "S4E12"]);
+        assert_eq!(found.prefixes, ["S4E11", "S4E12"]);
         assert!(found.source.contains("season and episode"), "{}", found.source);
     }
 
@@ -767,10 +844,10 @@ mod tests {
         // says nothing; comparing where the digits sat is what refuses it.
         assert_eq!(marked_number("期3話", words("Japanese").season), Some(3), "read on its own…");
         assert_eq!(marked_number("期3話", words("Japanese").episode), Some(3), "…both find it");
-        let sandwiched = episodes(&["期3話", "期12話"], &ids);
+        let sandwiched = episodes(&["期11話", "期12話"], &ids);
         assert_eq!(
             labels(&sandwiched, &ids).as_deref(),
-            Some("E03,E12"),
+            Some("E11,E12"),
             "the episode stands, and no season is taken from its digits"
         );
     }
@@ -848,40 +925,78 @@ mod tests {
     #[test]
     fn a_season_is_folded_in_ahead_of_the_episode() {
         let ids = ["1_aaaaaaaa", "1_bbbbbbbb"];
-        // The stated shape: season 5 episode 4 is 504, season 5 episode 11 is 511.
-        let page = episodes(&["S05E04", "S05E11"], &ids);
-        assert_eq!(labels(&page, &ids).as_deref(), Some("S5E04,S5E11"), "the stated shape");
+        // The stated shape, written out rather than folded into arithmetic — and padded to the
+        // width the set needs, so episode 9 becomes `E09` beside `E10`.
+        let page = episodes(&["S05E09", "S05E10"], &ids);
+        assert_eq!(labels(&page, &ids).as_deref(), Some("S5E09,S5E10"), "the stated shape");
         // Compact and spelled-out forms are the same thing.
-        let spelled = episodes(&["Season 3, Episode 12", "Season 3, Episode 2"], &ids);
-        assert_eq!(labels(&spelled, &ids).as_deref(), Some("S3E12,S3E02"));
+        let spelled = episodes(&["Season 3, Episode 12", "Season 3, Episode 11"], &ids);
+        assert_eq!(labels(&spelled, &ids).as_deref(), Some("S3E12,S3E11"));
         // Each part padded to the width its own set needs, so a short season stays short.
-        let short = episodes(&["S5E4", "S5E8"], &ids);
-        assert_eq!(labels(&short, &ids).as_deref(), Some("S5E4,S5E8"), "no needless zero");
+        let short = episodes(&["S5E4", "S5E5"], &ids);
+        assert_eq!(labels(&short, &ids).as_deref(), Some("S5E4,S5E5"), "no needless zero");
         // And the labels sort as text in the order they mean, which is the whole point of them.
         let mut sorted: Vec<String> =
             labels(&page, &ids).unwrap().split(',').map(str::to_string).collect();
         sorted.sort();
-        assert_eq!(sorted, ["S5E04", "S5E11"]);
+        assert_eq!(sorted, ["S5E09", "S5E10"]);
 
         // A season only counts when every name carries one — mixing 312 with a bare 2 would order
         // them absurdly, so the episode numbers stand alone instead. (The names still share an
         // opening, because that is what identifies them as the descriptive field in the first
         // place; see `described_by`.)
-        let mixed = episodes(&["A Show, Season 3, Episode 12", "A Show, Episode 2"], &ids);
-        assert_eq!(labels(&mixed, &ids).as_deref(), Some("E12,E02"));
+        let mixed = episodes(&["A Show, Season 3, Episode 12", "A Show, Episode 11"], &ids);
+        assert_eq!(labels(&mixed, &ids).as_deref(), Some("E12,E11"));
     }
 
     #[test]
-    fn marked_numbers_need_not_be_consecutive_because_the_name_vouched_for_them() {
-        // The consecutiveness test exists to catch numbers that might not be episode numbers at
-        // all. A name saying `Episode` has already settled that, so gaps are allowed — a page
-        // listing a selection of episodes is still numbered by them.
+    fn marked_numbers_must_run_consecutively_just_as_guessed_ones_do() {
+        // Saying `Episode` is good evidence about WHICH number is the episode. It is no evidence
+        // that the set is complete, and an `S7E01…S7E18` label set claims exactly that. A gap
+        // means one of the numbers is not what we think it is — or the page is a selection — and
+        // either way page order is the honest answer.
         let ids = ["1_aaaaaaaa", "1_bbbbbbbb", "1_cccccccc"];
         let gapped = episodes(&["Episode 1", "Episode 5", "Episode 9"], &ids);
-        assert_eq!(labels(&gapped, &ids).as_deref(), Some("E1,E5,E9"));
-        // A repeat is still refused: two files cannot share one prefix.
+        assert_eq!(labels(&gapped, &ids), None, "gaps are refused, marked or not");
+        // A run in any order is fine — the prefixes are not required to be sorted, only complete.
+        let shuffled = episodes(&["Episode 9", "Episode 7", "Episode 8"], &ids);
+        assert_eq!(labels(&shuffled, &ids).as_deref(), Some("E9,E7,E8"));
+        // A repeat is refused too: two files cannot share one prefix.
         let repeated = episodes(&["Episode 1", "Episode 1 again", "Episode 9"], &ids);
         assert_eq!(labels(&repeated, &ids), None);
+    }
+
+    #[test]
+    fn a_name_that_says_episode_twice_is_read_by_its_smallest_number_and_reported() {
+        // The shape that exposed this, in English: an episode numbered within its season *and*
+        // again within the whole series, so its name carries two episode numbers. Reading the LAST
+        // one made episode 15 into `S7E100` — a stray at 100 and a hole where 15 belonged. (The
+        // page it came from writes this in Hebrew; the rule is not language-specific, so the test
+        // reads in the language of the code.)
+        let ids = ["1_aaaaaaaa", "1_bbbbbbbb", "1_cccccccc"];
+        let real = episodes(
+            &[
+                "A Show, Season 7, Episode 14",
+                "A Show, Season 7, Episode 15 - Episode 100",
+                "A Show, Season 7, Episode 16",
+            ],
+            &ids,
+        );
+        let found = sequence(&real, &owned(&ids)).expect("14, 15 and 16 are a run");
+        assert_eq!(found.prefixes, ["S7E14", "S7E15", "S7E16"], "the SMALLEST number is the episode");
+        // And the doubt is carried out, so the run can say so in red rather than quietly guessing.
+        assert_eq!(found.ambiguous.len(), 1, "one name said it twice: {:?}", found.ambiguous);
+        assert!(found.ambiguous[0].contains("Episode 100"), "{:?}", found.ambiguous);
+        // Both numbers really are findable — this is a choice between them, not a parse failure.
+        let twice = "Episode 15 - Episode 100";
+        assert_eq!(marked_spans(twice, words("English").episode).len(), 2, "both are there");
+        assert_eq!(marked_number(twice, words("English").episode), Some(15), "the smaller wins");
+        // And it is the SIZE that decides, not the position: the same two numbers the other way
+        // round still read as 15. A page writing the series count first would otherwise break it.
+        assert_eq!(marked_number("Episode 100 - Episode 15", words("English").episode), Some(15));
+        // A name saying it once carries no doubt to report.
+        let plain = episodes(&["Episode 1", "Episode 2", "Episode 3"], &ids);
+        assert!(sequence(&plain, &owned(&ids)).expect("a run").ambiguous.is_empty());
     }
 
     #[test]
