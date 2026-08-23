@@ -20,10 +20,16 @@ vidl 'https://vimeo.com/12345' --audio
 |---|---|---|
 | `yt-dlp` | **required** | Found on `PATH`, or named through `tools::install`. |
 | `ffmpeg` + `ffprobe` | **required in practice** | Merging video+audio, muxing subtitle tracks, attaching cover art. Without them you get single-stream downloads and nothing else. |
-| `deno` | recommended | YouTube serves obfuscated player JavaScript that computes a media URL's signature. yt-dlp needs a JS runtime to execute it; without one, YouTube downloads lose formats or throttle. |
+| `deno` | recommended | YouTube serves obfuscated player JavaScript that computes a media URL's signature. yt-dlp needs a JS runtime to execute it; without one, YouTube downloads lose formats or throttle. Any runtime yt-dlp recognises will do (`node`, `bun`, `quickjs`). |
+| `pycryptodomex` | recommended | A Python package in yt-dlp's own environment (`pip install pycryptodomex`), not a system binary. Lets yt-dlp decrypt AES-128 HLS streams *itself*; without it every such download is handed to ffmpeg, which ignores `--concurrent-fragments`, reports no incremental progress, and is markedly slower. Many broadcasters serve nothing else. |
 | `curl` | optional | Only for fetching thumbnails from the image CDN. |
 
-Rust dependencies are just two: `clap` (the CLI) and `lofty` (in-place audio tag writes).
+Rust dependencies are just two: `clap` (the CLI) and `lofty` (in-place audio tag writes). Nothing
+else is linked in, and there is no build script.
+
+None of these is checked up front. Each fails at the point of use with a message naming what was
+missing, which is why the table above is worth reading before a first run: a machine without
+`ffmpeg` downloads perfectly well and then cannot merge, mux or attach anything afterwards.
 
 ```
 cargo build --release      # target/release/vidl

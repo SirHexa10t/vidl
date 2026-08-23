@@ -44,6 +44,8 @@ run_category() {
 run_category "offline"       cargo test --no-fail-fast -- --nocapture
 run_category "live-quick"    cargo test --test media_flags   -- --ignored --test-threads=1 --nocapture
 run_category "live-extended" cargo test --test live_extended -- --ignored --test-threads=1 --nocapture
+# Needs ffmpeg AND a site still serving a format it cannot deliver; skips itself if either is gone.
+run_category "live-ffmpeg"   cargo test --test ffmpeg_downloads -- --ignored --test-threads=1 --nocapture
 
 echo
 echo "=== summary ==="

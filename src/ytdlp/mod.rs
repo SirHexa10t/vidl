@@ -105,8 +105,20 @@ pub(crate) fn common(archive_dir: &Path, env: Env, langs: &[String]) -> Vec<OsSt
     // needs muxing it cannot do itself — an AES-128 HLS stream, most often. yt-dlp passes ffmpeg
     // only `-hide_banner` and leaves its log level at the default `info`, at which ffmpeg announces
     // every segment it opens: measured at 161 lines and 144 KB for one 26-minute episode, because
-    // each line carries a signed CDN URL. `-stats` asks for the progress line back, since at that
-    // level it is the only sign of life during the mux.
+    // each line carries a signed CDN URL.
+    //
+    // One key is enough, and it was worth measuring rather than reasoning about. yt-dlp puts these
+    // args in ffmpeg's *output* position, and ffmpeg parses its whole command line before opening
+    // any input — so the log level is already in force by the time the HLS demuxer reads its first
+    // segment. Verified against the real stream: `Opening` lines drop from 7 in 20 seconds to 0,
+    // whether the flag sits before `-i`, after it, or both.
+    //
+    // (yt-dlp resolves the *input* position from `ffmpeg_i1`/`ffmpeg_i` only, never falling back to
+    // the bare name. That is true and it is a trap for anything that must genuinely precede `-i` —
+    // it just isn't needed for this.)
+    //
+    // `-stats` asks for the progress line back: at this level it is the only sign of life during a
+    // long mux.
     let mut argv: Vec<OsString> = [
         "--ignore-errors",
         "--concurrent-fragments", "4",
@@ -376,8 +388,14 @@ mod tests {
         // The ffmpeg downloader is quieted on every path, not just the retries: a first-attempt
         // HLS download reaches for ffmpeg exactly the same way, and at ffmpeg's default log level
         // it names every segment it opens — one signed CDN URL per line.
+        // The ffmpeg downloader is quieted on every path, not just the retries: a first-attempt
+        // HLS download reaches for ffmpeg exactly the same way, and at ffmpeg's default log level it
+        // names every segment it opens — one signed CDN URL per line. `tests/ffmpeg_downloads.rs`
+        // is what proves the flag actually silences it; this only proves it is sent.
         let quieted = text.windows(2).any(|pair| {
-            pair[0] == "--downloader-args" && pair[1].starts_with("ffmpeg:") && pair[1].contains("-loglevel error")
+            pair[0] == "--downloader-args"
+                && pair[1].starts_with("ffmpeg:")
+                && pair[1].contains("-loglevel error")
         });
         assert!(quieted, "the ffmpeg downloader must be quieted: {text:?}");
         // Same shared knobs + log files as the YouTube path (metadata, thumbnail, mkv, archive).
