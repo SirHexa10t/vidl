@@ -75,6 +75,14 @@ gets **232 bytes here against the 151 a bounded template had to settle for**, an
 to write stops being possible rather than merely survivable. A rename that can't happen leaves the
 file called by its id — a poor name, not a lost download.
 
+A direct stream URL has no title to work from at all — yt-dlp names the file after the manifest, so
+`…/kung-fury/master.m3u8` lands as `master [master].mp4`. Two answers, in order of trust:
+`--name "Kung Fury"` says exactly what to call it, and failing that the path above the manifest is
+used when the title is nothing but a manifest stem (`master`, `index`, `playlist`, …), giving
+`kung-fury [master].mp4`. A title the site really offered is never second-guessed, however plain.
+`--name` covers one file, so a playlist, a channel or `--multi` refuses it rather than putting one
+name on twenty files — `-- -o <template>` is the lever for those.
+
 The format is in that temporary name for a reason that has nothing to do with length. yt-dlp
 resumes a leftover `.part` by byte offset and cannot tell whether those bytes came from the
 rendition now being asked for; naming the file after its rendition means a different one finds

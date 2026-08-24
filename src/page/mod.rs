@@ -172,7 +172,10 @@ fn download_each(
         }
         // Per sibling, because the position belongs to this one file and the next download would
         // overwrite the record it was named from.
-        names::rename_downloaded(home, limit, Some(&label));
+        // No naming hints here: a collection's entries carry their own titles (that is how the
+        // numbering found them), and one `--name` across twenty files would name them all alike —
+        // which `cli::run` refuses outright rather than half-applying.
+        names::rename_downloaded(home, limit, Some(&label), names::Naming::default());
     }
     if !unreachable.is_empty() {
         eprintln!(

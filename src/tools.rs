@@ -20,9 +20,11 @@ use std::sync::OnceLock;
 pub struct Tools {
     /// The yt-dlp binary, or the zipapp to hand to [`Tools::python`].
     pub ytdlp: Option<OsString>,
-    /// The interpreter to run a yt-dlp *zipapp* through. A yt-dlp that is a real binary ignores
-    /// this; a zipapp's `env python3` shebang would otherwise pick up whatever the caller's PATH
-    /// offers, which is how the wrong interpreter (without curl_cffi) gets used.
+    /// A python interpreter, used for two things. It runs a yt-dlp *zipapp* — a real yt-dlp binary
+    /// ignores it, but a zipapp's `env python3` shebang would otherwise pick up whatever the
+    /// caller's PATH offers, which is how the wrong interpreter (without curl_cffi) gets used. And
+    /// it runs the cookie-store filter's sqlite work (see [`crate::cookies::filter`]), which needs
+    /// nothing but the standard library's `sqlite3` module.
     pub python: Option<OsString>,
     /// The directory holding `ffmpeg` and `ffprobe` — the muxing and inspection behind every
     /// thumbnail and subtitle pass.
@@ -53,6 +55,16 @@ pub(crate) fn ytdlp() -> (OsString, Option<OsString>) {
     // zipapp when an embedder named a python AND the yt-dlp path isn't the bare PATH name.
     let python = tools.python.clone().filter(|_| tools.ytdlp.is_some());
     (ytdlp, python)
+}
+
+/// The interpreter for this crate's own sqlite work — the cookie-store filter and the expiry
+/// probe, which read a browser's cookie database through python's standard-library `sqlite3`.
+///
+/// Unlike [`ytdlp`]'s interpreter, this is not conditional on how yt-dlp was installed: the work
+/// is ours, not yt-dlp's. An embedder's pinned python when it named one (which is also the one
+/// certain to exist), else `python3` on PATH.
+pub(crate) fn python() -> OsString {
+    configured().python.clone().unwrap_or_else(|| OsString::from("python3"))
 }
 
 /// The `ffmpeg` to run — inside a bundled ffmpeg's `bin/` when an embedder named one, otherwise

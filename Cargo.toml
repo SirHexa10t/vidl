@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 lofty = "0.24"          # in-place audio metadata writes — the subtitle tags on `--audio` downloads
+software_inventory = { git = "https://github.com/SirHexa10t/software_inventory.git", branch = "main" }   # where installed browsers keep their cookie stores, for `--cookie-import`
 
 # Its own workspace root: `vidl` is an independent repo that bashrs happens to keep beside it
 # as a path dependency, so it must build exactly as it will once moved away.

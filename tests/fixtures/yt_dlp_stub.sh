@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# A yt-dlp stand-in for the offline tests (tests/dl_stubbed_flows.rs, tests/dl_cookie_import.rs):
+# A yt-dlp stand-in for the offline tests (tests/stubbed_flows.rs, tests/media_flags.rs):
 # deterministic and network-free. The tests put this first on PATH (as `yt-dlp`) under a scratch
 # HOME with no bundled tools, so the binary's own resolution lands here.
 #
-# Bash builtins only — no cat/cp/touch — so it also runs on the cookie-import rig's HERMETIC
-# PATH, which holds nothing but {yt-dlp, python3, bash}.
+# Bash builtins only — no cat/cp/touch — so it also runs on a HERMETIC PATH holding nothing but
+# {yt-dlp, python3, bash}, which is what the cookie-readability rig gives it.
 #
 # Contract:
 #   VIDL_STUB_DIR   scratch dir — every invocation's argv is appended to calls.log; scan.txt
@@ -33,7 +33,7 @@
 # it appends archive_adds.txt (if present) to the run's --download-archive (the collection
 # post-mortem reads it), appends names_adds.txt (if present) to the run's --print-to-file target
 # (the shortened-name record reads that), and copies cookie_dump.txt (if present) to a
-# `--cookies <file>` target (the cookie-import readability check reads that).
+# `--cookies <file>` target (the cookie-readability check reads that).
 
 args=" $* "
 dir="${VIDL_STUB_DIR:?VIDL_STUB_DIR must point at the test scratch dir}"

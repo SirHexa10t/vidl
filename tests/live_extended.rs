@@ -95,9 +95,9 @@ fn find_by_id(dir: &Path, id: &str) -> Option<PathBuf> {
 /// Both shapes yt-dlp accepts are supported, because both are shapes people actually have:
 ///
 /// - **a browser store** — a `browser.spec` naming the browser beside a `store/` directory
-///   holding its cookie DB — becomes `--cookies-from-browser <browser>:<store>`. This is what a
+///   holding its cookie DB — passed as `--cookies-use <browser>:<store>`. This is what a
 ///   tool that copies a profile's cookies produces, and what an embedder hands this crate.
-/// - **a Netscape jar** (`youtube.txt`) becomes `--cookies <file>`. The portable shape, and what
+/// - **a Netscape jar** (`youtube.txt`) passed as `--cookies-use <file>`. The portable shape, and what
 ///   browser extensions export.
 ///
 /// Stores are kept one directory per site, so `<base>/<site>/` is checked before `<base>` itself
@@ -135,7 +135,7 @@ fn browser_store(dir: &Path) -> Option<[String; 2]> {
     let store = dir.join("store");
     let populated = std::fs::read_dir(&store).is_ok_and(|mut entries| entries.next().is_some());
     (!browser.is_empty() && populated)
-        .then(|| ["--cookies-from-browser".to_string(), format!("{browser}:{}", store.display())])
+        .then(|| ["--cookies-use".to_string(), format!("{browser}:{}", store.display())])
 }
 
 /// A Netscape jar as a `--cookies` pair. A file with no cookie rows counts as not supplied, for
@@ -144,7 +144,7 @@ fn netscape_jar(jar: &Path) -> Option<[String; 2]> {
     let rows = std::fs::read_to_string(jar).ok()?;
     rows.lines()
         .any(|line| !line.trim().is_empty() && !line.starts_with('#'))
-        .then(|| ["--cookies".to_string(), jar.display().to_string()])
+        .then(|| ["--cookies-use".to_string(), jar.display().to_string()])
 }
 
 #[test]

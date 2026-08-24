@@ -148,11 +148,21 @@ fn an_hls_stream_handed_to_ffmpeg_is_downloaded_without_narrating_every_segment(
         .arg(&url)
         .output()
         .expect("run yt-dlp");
+    let control_landed = dir.join("control.mp4").exists();
     let control = text(&control);
     assert!(
         narrated(&control) > 0,
         "the control must narrate, or this test proves nothing: {control}"
     );
+    // The control also establishes that this machine *can* do the thing at all. Some ffmpeg builds
+    // cannot — the johnvansickle 7.0.2 static build segfaults (`code -11`) on every HLS stream it
+    // was given here, after logging. With no working baseline there is nothing to compare against,
+    // so say so rather than blame the argument under test.
+    if !control_landed {
+        eprintln!("SKIPPED {test}: this ffmpeg cannot download HLS at all (the control produced no file)");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     // The same download through `vidl`, which passes the quieting arguments.
     let into = scratch("hls_quiet_into");
@@ -160,7 +170,12 @@ fn an_hls_stream_handed_to_ffmpeg_is_downloaded_without_narrating_every_segment(
         .arg(&url)
         .arg("--into")
         .arg(&into)
+        // The metadata postprocessors are switched off deliberately. What is under test is how the
+        // *downloader* logs, and leaving them on makes the test fail on any ffmpeg build that
+        // cannot postprocess — which is a fault in the build, not in the argument being pinned.
+        // `media_flags.rs` is what covers the postprocessing.
         .args(["--", "--hls-prefer-ffmpeg", "--no-progress"])
+        .args(["--no-embed-metadata", "--no-embed-chapters"])
         .output()
         .expect("run vidl");
     let all = text(&out);

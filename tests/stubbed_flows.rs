@@ -228,6 +228,86 @@ fn a_finished_download_says_so_in_green() {
 }
 
 #[test]
+fn a_stream_url_with_no_title_is_named_from_its_path_or_from_the_caller() {
+    // A bare manifest gives yt-dlp nothing to read a title from, so it names the file after the
+    // manifest and the download lands as `master [master].mp4`. Two ways out, and this pins both.
+    const URL: &str = "https://cdn.example/hls/kung-fury/master.m3u8";
+
+    // Without a name: the path supplies one. The record is what yt-dlp reports for such a URL —
+    // title and id both the manifest's own stem.
+    let rig = Rig::new("name_from_path");
+    rig.names("master", "master__0.mp4", "master");
+    let out = rig.dl("ok", URL, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        rig.files().iter().any(|name| name == "kung-fury [master].mp4"),
+        "the path above the manifest names it: {:?}",
+        rig.files()
+    );
+
+    // With one: exactly what was asked for, and the id stays so the file is still traceable.
+    let rig = Rig::new("name_given");
+    rig.names("master", "master__0.mp4", "master");
+    let out = rig.dl("ok", URL, &["--name", "Kung Fury"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        rig.files().iter().any(|name| name == "Kung Fury [master].mp4"),
+        "the caller's name wins: {:?}",
+        rig.files()
+    );
+}
+
+#[test]
+fn a_cookie_store_from_nowhere_is_refused_with_the_flag_that_would_work() {
+    // Nothing in the path says which browser wrote it, and the browser decides which keyring entry
+    // holds the decryption key — so guessing would reproduce the very failure this replaces.
+    let rig = Rig::new("cookie_orphan");
+    let store = rig.root.join("harvested");
+    fs::write(&store, b"SQLite format 3\0binary").unwrap();
+    let out = rig.dl("ok", YT_VIDEO, &["--cookies-use", store.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("not a Netscape cookies file"), "{all}");
+    assert!(all.contains("--cookies-use <browser>:"), "and the form to use instead: {all}");
+    assert!(rig.calls().is_empty(), "refused before yt-dlp was ever run:\n{}", rig.calls());
+}
+
+#[test]
+fn a_netscape_cookies_file_is_passed_through_untouched() {
+    // The common case must not be disturbed by any of the above.
+    let rig = Rig::new("cookie_text");
+    let file = rig.root.join("cookies.txt");
+    fs::write(&file, "# Netscape HTTP Cookie File\n.x\tTRUE\t/\tTRUE\t0\ta\tb\n").unwrap();
+    let out = rig.dl("ok", YT_VIDEO, &["--cookies-use", file.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let calls = rig.calls();
+    assert!(calls.contains(&format!("--cookies {}", file.display())), "{calls}");
+    assert!(!calls.contains("--cookies-from-browser"), "{calls}");
+}
+
+#[test]
+fn a_name_for_many_files_is_refused_rather_than_half_applied() {
+    // `--name` names ONE file. Anything that downloads several would put the same name on all of
+    // them, so it stops instead — with the lever that does work for those.
+    let rig = Rig::new("name_refused");
+    for (label, args) in [
+        ("--multi", vec!["--name", "X", "--multi"]),
+        ("a playlist", vec!["--name", "X"]),
+    ] {
+        let url = if label == "--multi" {
+            "https://cdn.example/hls/kung-fury/master.m3u8"
+        } else {
+            "https://www.youtube.com/playlist?list=PLstub"
+        };
+        let out = rig.dl("ok", url, &args);
+        assert_eq!(out.status.code(), Some(2), "{label} must be refused: {}", text(&out));
+        let all = text(&out);
+        assert!(all.contains("--name is for one video"), "{label}: {all}");
+        assert!(all.contains("-o <template>"), "{label}: and points at what works: {all}");
+    }
+}
+
+#[test]
 fn a_run_clears_unfinishable_leftovers_from_the_destination_before_downloading() {
     // The litter an interrupted older run leaves behind: partial files named without a rendition,
     // which the current naming can never resume and so would otherwise sit there forever.
@@ -340,7 +420,7 @@ fn gated_failures_land_honest_cookie_aware_ledger_lines() {
     // must appear instead. The jar below is empty, which is fine: only its presence on the argv
     // decides the wording, and the stub never reads it.
     let rig = Rig::new("age_cookies");
-    rig.dl("age", YT_VIDEO, &["--cookies", &rig.jar()]);
+    rig.dl("age", YT_VIDEO, &["--cookies-use", &rig.jar()]);
     assert!(rig.ledger().contains("age-restricted despite cookies"), "{}", rig.ledger());
 
     // Bot-wall: honest that it may be undownloadable.
@@ -355,7 +435,7 @@ fn gated_failures_land_honest_cookie_aware_ledger_lines() {
 
     // DRM with cookies in play: terminal — no advice the user already took, no retry pretence.
     let rig = Rig::new("drm_cookies");
-    rig.dl("drm", YT_VIDEO, &["--cookies", &rig.jar()]);
+    rig.dl("drm", YT_VIDEO, &["--cookies-use", &rig.jar()]);
     assert!(rig.ledger().contains("DRM-protected even with cookies"), "{}", rig.ledger());
 }
 
@@ -1024,7 +1104,7 @@ fn a_youtube_shaped_path_on_another_host_is_still_generic() {
 fn cookie_flags_reach_yt_dlp_verbatim_on_every_invocation() {
     let rig = Rig::new("cookies_file");
     let jar = rig.jar();
-    rig.dl("ok", YT_VIDEO, &["--cookies", &jar]);
+    rig.dl("ok", YT_VIDEO, &["--cookies-use", &jar]);
     let calls = rig.calls();
     assert!(calls.lines().count() > 1, "the YouTube path probes before downloading:\n{calls}");
     for line in calls.lines().filter(|line| !line.trim().is_empty()) {
@@ -1032,7 +1112,7 @@ fn cookie_flags_reach_yt_dlp_verbatim_on_every_invocation() {
     }
 
     let rig = Rig::new("cookies_browser");
-    rig.dl("ok", YT_VIDEO, &["--cookies-from-browser", "firefox:/some/dir"]);
+    rig.dl("ok", YT_VIDEO, &["--cookies-use", "firefox:/some/dir"]);
     let calls = rig.calls();
     for line in calls.lines().filter(|line| !line.trim().is_empty()) {
         assert!(

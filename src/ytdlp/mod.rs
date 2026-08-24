@@ -45,17 +45,11 @@ fn bundle_flags_for(js_runtime: Option<&Path>, ffmpeg_dir: Option<&Path>) -> Vec
 }
 
 /// The cookie flags for an invocation: an explicit `--cookies` file wins; otherwise a
-/// `--cookies-from-browser` spec from a prior `--cookie-import`; otherwise none. Shared by the
+/// `--cookies-from-browser` spec, however the caller came by it; otherwise none. Shared by the
 /// download argv ([`common`]) and the metadata invocations ([`seeded`]) so gated content
 /// (age-restricted, members-only) is readable at *every* phase, not just the final download.
 fn cookie_args(env: Env) -> Vec<OsString> {
-    if let Some(file) = env.cookies {
-        vec!["--cookies".into(), file.as_os_str().to_owned()]
-    } else if let Some(spec) = env.cookies_from_browser {
-        vec!["--cookies-from-browser".into(), spec.into()]
-    } else {
-        Vec::new()
-    }
+    crate::cookies::flags(env.cookies, env.cookies_from_browser)
 }
 
 /// `--force-ipv4` unless the user opted into IPv6. Added to *every* network invocation (via
@@ -438,7 +432,7 @@ mod tests {
         let pair = |argv: &[OsString], flag: &str| {
             argv.iter().position(|a| a == flag).map(|i| argv[i + 1].to_string_lossy().into_owned())
         };
-        // A prior --cookie-import with no explicit file: the browser spec is passed.
+        // A browser spec with no explicit file: the spec is passed.
         let imported = common(
             Path::new("/dl"),
             Env { cookies_from_browser: Some("firefox:/store"), ..Default::default() },

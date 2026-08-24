@@ -400,7 +400,7 @@ fn age_restricted_line(label: &str, had_cookies: bool) -> String {
     if had_cookies {
         format!("{label} — age-restricted despite cookies (use a signed-in 18+ account; play it in that browser once to verify age, then re-import; past that, the last lever is a PO-token provider — not integrated yet)")
     } else {
-        format!("{label} — age-restricted (needs cookies from a signed-in 18+ account: dl --cookie-import youtube, then retry)")
+        format!("{label} — age-restricted (needs cookies from a signed-in 18+ account: --cookies-use <file-or-browser>, then retry)")
     }
 }
 
@@ -412,7 +412,7 @@ fn login_required_line(label: &str, had_cookies: bool) -> String {
     if had_cookies {
         format!("{label} — still blocked with cookies (the account may lack access, or the cookies went stale — re-import from a browser where it plays)")
     } else {
-        format!("{label} — needs an account with access: import cookies (dl --cookie-import <site>), then retry")
+        format!("{label} — needs an account with access: supply cookies (--cookies-use <file-or-browser>), then retry")
     }
 }
 
@@ -424,7 +424,7 @@ fn sensitive_content_line(label: &str, had_cookies: bool) -> String {
     if had_cookies {
         format!("{label} — flagged sensitive and still blocked with cookies (the account must be allowed to view sensitive/mature content — re-import from a browser where it plays)")
     } else {
-        format!("{label} — flagged sensitive (not for all audiences): needs a signed-in account allowed to view it (dl --cookie-import <site>), then retry")
+        format!("{label} — flagged sensitive (not for all audiences): needs a signed-in account allowed to view it (--cookies-use <file-or-browser>), then retry")
     }
 }
 
@@ -446,7 +446,7 @@ fn drm_line(label: &str, had_cookies: bool) -> String {
     if had_cookies {
         format!("{label} — DRM-protected even with cookies (yt-dlp doesn't circumvent DRM — undownloadable)")
     } else {
-        format!("{label} — DRM-protected formats only; cookies sometimes unlock non-DRM variants (on YouTube even a logged-out session works): dl --cookie-import <site>, then retry")
+        format!("{label} — DRM-protected formats only; cookies sometimes unlock non-DRM variants (on YouTube even a logged-out session works): --cookies-use <file-or-browser>, then retry")
     }
 }
 
@@ -758,6 +758,51 @@ mod tests {
     }
 
     #[test]
+    fn no_advice_names_a_command_this_crate_does_not_have() {
+        // These lines used to read `dl --cookie-import <site>` — a flag belonging to a project that
+        // depends on THIS one. A standalone run has no `dl` and no such flag, so the advice sent
+        // people looking for a command that did not exist. A library may name its own levers only;
+        // an embedder with friendlier wording owns its own user-facing text.
+        let lines = [
+            age_restricted_line("x", false),
+            login_required_line("x", false),
+            sensitive_content_line("x", false),
+            drm_line("x", false),
+            bot_wall_line("x"),
+            name_too_long_line("x", true),
+        ];
+        for line in &lines {
+            assert!(!line.contains("cookie-import"), "names a consumer's flag: {line}");
+            assert!(!line.contains("dl --"), "names a consumer's command: {line}");
+        }
+        // And the four that are about access really do name a lever this crate accepts.
+        for line in &lines[..4] {
+            assert!(line.contains("--cookies-use"), "cookie advice must name the flag: {line}");
+        }
+
+        // Checked against the REAL command line, not a list spelled here. The previous guard
+        // named the flags itself, so when `--cookies` and `--cookies-from-browser` merged into
+        // `--cookies-use` it went on passing while every line of advice pointed at two flags that
+        // no longer existed. A flag is only advice if it is a flag.
+        let command = <crate::Args as clap::Args>::augment_args(clap::Command::new("vidl"));
+        let known: Vec<&str> = command.get_arguments().filter_map(clap::Arg::get_long).collect();
+        for line in &lines {
+            for word in line.split_whitespace() {
+                let Some(at) = word.find("--") else { continue };
+                let flag: String =
+                    word[at + 2..].chars().take_while(|c| c.is_alphanumeric() || *c == '-').collect();
+                if flag.is_empty() {
+                    continue;
+                }
+                assert!(
+                    known.contains(&flag.as_str()),
+                    "advice names `--{flag}`, which vidl has no such flag for: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_403_hint_appears_only_once_a_retry_has_already_failed_and_does_not_oversell_a_new_network() {
         // Reached only from the `Other` arm, which runs after the plain diagnostic re-run — so the
         // hint can afford to talk about a block, which it could not before that re-run.
@@ -833,7 +878,7 @@ mod tests {
     fn the_age_restricted_line_adapts_to_whether_cookies_were_tried() {
         let without = age_restricted_line("[dQw4w9WgXcQ]", false);
         assert!(without.contains("age-restricted"), "names the gate");
-        assert!(without.contains("--cookie-import"), "nudges toward importing cookies");
+        assert!(without.contains("--cookies"), "nudges toward supplying cookies");
         assert!(!without.contains("despite"), "the no-cookies case just asks for cookies");
 
         let with = age_restricted_line("[dQw4w9WgXcQ]", true);
@@ -850,7 +895,7 @@ mod tests {
         // logged-out session) surface non-DRM ones — so cookies are a genuine first fix.
         let without = drm_line("[dQw4w9WgXcQ]", false);
         assert!(without.contains("DRM-protected"), "names the gate");
-        assert!(without.contains("--cookie-import"), "cookies are the one real lever");
+        assert!(without.contains("--cookies"), "cookies are the one real lever");
         let with = drm_line("[dQw4w9WgXcQ]", true);
         assert!(with.contains("even with cookies"), "won't repeat advice already taken");
         assert!(with.contains("doesn't circumvent"), "honest that this is terminal");
@@ -861,7 +906,7 @@ mod tests {
     #[test]
     fn the_login_required_line_points_at_cookies_and_adapts_to_whether_they_were_tried() {
         let without = login_required_line("[dQw4w9WgXcQ]", false);
-        assert!(without.contains("--cookie-import"), "nudges toward importing cookies");
+        assert!(without.contains("--cookies"), "nudges toward supplying cookies");
         assert!(without.contains("retry"), "with cookies as the real fix, retrying is right advice");
 
         let with = login_required_line("[dQw4w9WgXcQ]", true);
@@ -874,7 +919,7 @@ mod tests {
     fn the_sensitive_content_line_points_at_an_allowed_account_and_adapts_to_cookies() {
         let without = sensitive_content_line("[dQw4w9WgXcQ]", false);
         assert!(without.contains("sensitive"), "names why it's gated");
-        assert!(without.contains("--cookie-import") && without.contains("retry"), "cookies are the fix");
+        assert!(without.contains("--cookies") && without.contains("retry"), "cookies are the fix");
 
         let with = sensitive_content_line("[dQw4w9WgXcQ]", true);
         assert!(with.contains("sensitive/mature") || with.contains("allowed to view"), "names the account condition");

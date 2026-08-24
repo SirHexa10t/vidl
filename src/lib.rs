@@ -14,6 +14,8 @@
 //!   and the per-video subtitle plan drawn from the caption matrix.
 //! - `page/` — what a *page* lists, when it lists more than one video: reached only through
 //!   `--multi`, so nothing in it runs on a page that already works.
+//! - `cookies` — what a caller's cookie arguments mean, resolved once per run into flags yt-dlp
+//!   can act on (a browser's own store is not a Netscape file, and Flatpak hides profiles).
 //! - `tools`/`util` — where the external programs live, and the handful of dependency-free
 //!   helpers (process, colour, timestamp) the two halves share.
 //!
@@ -30,15 +32,20 @@
 //! - [`classify`] plus the `download_*` functions, driven by an [`Env`], for a caller that wants
 //!   to make the routing decision itself.
 //!
-//! yt-dlp is expected on `PATH`. An embedder that pins its own copy (or bundles ffmpeg or a JS
-//! runtime) names them through [`tools::install`] once at startup. Cookies are *not* this crate's
-//! business: it accepts a `--cookies` file or a `--cookies-from-browser` spec and passes it on,
-//! leaving acquisition — finding browsers, paring a cookie DB to one site — to whoever has an
-//! opinion about it.
+//! yt-dlp is expected on `PATH`. An embedder that pins its own copy (or bundles ffmpeg, a JS
+//! runtime, or the python behind the cookie filter) names them through [`tools::install`] once at
+//! startup.
+//!
+//! Cookies are acquired here as well as used: `--cookies-extract-for-domain` copies one site's cookies
+//! out of an installed browser into a store of its own, and every later run on that site finds it
+//! without being told. Only the *paring* is this crate's opinion — knowing which cookie domains a
+//! site's auth lives in is downloader knowledge. Where browsers keep their profiles is not, and
+//! comes from `software_inventory`, so a browser added there widens the scan for free.
 
 pub mod tools;
 
 mod cli;
+mod cookies;
 mod keywords;
 mod media;
 mod page;
@@ -52,10 +59,11 @@ pub use cli::{Args, run};
 /// programs are*; that is [`tools`]'s job and is set once per process.
 #[derive(Clone, Copy, Default)]
 pub struct Env<'a> {
-    /// The `--cookies` file, when the caller supplied one (explicit; wins over the browser spec).
+    /// A Netscape cookies file, when the run resolved to one (explicit; wins over a browser spec).
     pub cookies: Option<&'a Path>,
-    /// A `--cookies-from-browser` spec (`<browser>[:<dir>]`), used on every run unless an
-    /// explicit `--cookies` file overrides it.
+    /// A browser spec (`<browser>[:<dir>]`) for yt-dlp's `--cookies-from-browser`, used on every
+    /// invocation unless a cookies file overrides it. These two mirror yt-dlp's own pair of flags;
+    /// on the command line they are one `--cookies-use`, split by [`crate::cookies`].
     pub cookies_from_browser: Option<&'a str>,
     /// Audio-only extraction (`-x`).
     pub audio: bool,
@@ -76,6 +84,10 @@ pub struct Env<'a> {
     /// collection behind one URL is downloaded as that collection instead of as its featured
     /// video. Opt-in, so a page that already works cannot be disturbed by it.
     pub multi: bool,
+    /// `--name`: what to call the downloaded file, for the case where the site offers no title
+    /// worth having. Applies to the generic path only — the YouTube paths name from a template and
+    /// have no rename pass to apply it in, and `cli::run` says so rather than ignoring the flag.
+    pub name: Option<&'a str>,
     /// Raw passthrough args, appended after every default so they win any flag repeated.
     pub extra: &'a [String],
 }
@@ -299,7 +311,10 @@ pub fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
     if names::caller_named_output(env.extra) {
         names::discard_names(into);
     } else {
-        names::rename_downloaded(into, names::limit(), None);
+        // The URL goes along so a download that arrived with no title of its own — a bare
+        // manifest, most often — can be named after the path that led to it.
+        let naming = names::Naming { given: env.name, source: Some(url) };
+        names::rename_downloaded(into, names::limit(), None, naming);
     }
     scrub_ledger(into);
     code

@@ -638,14 +638,75 @@ fn take_scratch(dir: &Path) -> Option<Vec<Recorded>> {
 ///
 /// A file that can't be renamed keeps its temporary name. That is a poor name, not a lost
 /// download — the graceful degradation the bounded-template approach could not offer.
-pub(crate) fn rename_downloaded(dir: &Path, limit: usize, label: Option<&str>) {
+/// What to call a downloaded file when its own metadata cannot say.
+///
+/// Both fields are last resorts, and in this order: `given` beats everything, and `source` is mined
+/// only when the site offered no title at all. A page that names its videos properly — which is
+/// most of them — reaches neither.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Naming<'a> {
+    /// `--name`: exactly what the caller wants this file called.
+    pub(crate) given: Option<&'a str>,
+    /// The address the download came from, for [`named_by_path`].
+    pub(crate) source: Option<&'a str>,
+}
+
+/// File stems that name nothing.
+///
+/// A direct stream URL ends in one of these far more often than not, and yt-dlp's generic extractor
+/// has nowhere else to look for a title — so it uses the URL's own file stem for both the title and
+/// the id, and the download lands as `master [master].mp4`. The path segment above it is usually
+/// what a person would have called the thing.
+const NAMELESS_STEMS: [&str; 8] =
+    ["master", "index", "playlist", "manifest", "chunklist", "prog_index", "stream", "out"];
+
+/// The title to file a download under: what was asked for, what the site said, or what the URL
+/// implies — in that order.
+///
+/// The URL is consulted only when the site said *nothing*, which shows up as a title identical to
+/// the id: both came from the same URL file stem. A real title is left alone however plain it is,
+/// because guessing over the top of one is worse than the plainness.
+fn chosen_title(title: &str, id: &str, naming: Naming) -> String {
+    if let Some(given) = naming.given {
+        return given.to_string();
+    }
+    let stub = title == id && NAMELESS_STEMS.contains(&title.to_lowercase().as_str());
+    if !stub {
+        return title.to_string();
+    }
+    naming.source.and_then(named_by_path).unwrap_or_else(|| title.to_string())
+}
+
+/// The last part of `url`'s path that names something, skipping the file itself and any further
+/// [`NAMELESS_STEMS`] above it. `None` when the path holds nothing but the file.
+///
+/// A heuristic, and it can pick a hash as readily as a name — but it only ever runs in place of a
+/// title that was already `master`, so the worst it does is trade one meaningless name for another.
+fn named_by_path(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let path = after_scheme.split(['?', '#']).next()?;
+    // `skip(1)` drops the host: it names the site, not the video, and the folder is named for the
+    // site already.
+    let mut segments: Vec<&str> = path.split('/').skip(1).filter(|part| !part.is_empty()).collect();
+    segments.pop()?; // the manifest itself — the name being replaced
+    while let Some(segment) = segments.pop() {
+        let stem = segment.split('.').next().unwrap_or(segment);
+        if !stem.is_empty() && !NAMELESS_STEMS.contains(&stem.to_lowercase().as_str()) {
+            return Some(stem.to_string());
+        }
+    }
+    None
+}
+
+pub(crate) fn rename_downloaded(dir: &Path, limit: usize, label: Option<&str>, naming: Naming) {
     let Some(records) = take_scratch(dir) else { return };
     let prefix = position_prefix(label);
     let mut cut = Vec::new();
     for record in records {
         let from = Path::new(&record.path);
         let Some(ext) = from.extension().and_then(|ext| ext.to_str()) else { continue };
-        let wanted = final_name(&prefix, &record.title, &record.id, ext, limit);
+        let title = chosen_title(&record.title, &record.id, naming);
+        let wanted = final_name(&prefix, &title, &record.id, ext, limit);
         if from.file_name().is_some_and(|name| name == wanted.as_str()) {
             continue; // already right — nothing was temporary about it
         }
@@ -664,10 +725,10 @@ pub(crate) fn rename_downloaded(dir: &Path, limit: usize, label: Option<&str>) {
         // shortening that only ever removed a slash. The id is checked too — this path is the one
         // that bounds it, and a URL-derived id cut down to fit would otherwise vanish without the
         // record that keys itself by the whole one.
-        let whole = sanitize(&record.title);
+        let whole = sanitize(&title);
         if !wanted.contains(whole.trim_end()) || record.id.len() > ID_BYTES {
             let room = title_room(&prefix, &record.id, ext, limit);
-            cut.push((record.id, record.title, room));
+            cut.push((record.id, title, room));
         }
     }
     announce_and_record(dir, cut);
@@ -896,7 +957,7 @@ mod tests {
         )
         .unwrap();
 
-        rename_downloaded(&dir, DEFAULT_NAME_MAX, None);
+        rename_downloaded(&dir, DEFAULT_NAME_MAX, None, Naming::default());
         let record = std::fs::read_to_string(dir.join(MODIFIED_LEDGER))
             .expect("a cut id is worth recording even when the title fitted");
         assert!(record.contains(&long_id), "keyed by the id in full: {record}");
@@ -1227,6 +1288,48 @@ mod tests {
                 "`{template}` has no `__`, which would make the stale-part sweep unsafe"
             );
         }
+    }
+
+    #[test]
+    fn a_name_the_caller_gave_beats_everything_the_site_said() {
+        // The whole point of `--name`: a direct stream URL has no title to work from, and a caller
+        // who knows what the thing is should not have to accept `master [master].mp4`.
+        let given = Naming { given: Some("Kung Fury"), source: Some("https://cdn.test/a/master.m3u8") };
+        assert_eq!(chosen_title("master", "master", given), "Kung Fury");
+        // It wins over a perfectly good title too — it was asked for explicitly.
+        assert_eq!(chosen_title("A Real Title", "abc123", given), "Kung Fury");
+    }
+
+    #[test]
+    fn a_title_the_site_actually_offered_is_never_second_guessed() {
+        // The guard on the whole fallback. Only a title that is *identical to the id* can have come
+        // from the URL's own file stem, and only a stem that names nothing is worth replacing.
+        let from = |url| Naming { given: None, source: Some(url) };
+        let url = "https://cdn.test/videos/kung-fury/master.m3u8";
+        // A real title, however plain, stands — even when the URL could offer something.
+        assert_eq!(chosen_title("Episode 4", "master", from(url)), "Episode 4");
+        // A stub that is not a manifest name stands too: `v` might be what the video is called.
+        assert_eq!(chosen_title("v", "v", from(url)), "v");
+        // And the case the fallback exists for.
+        assert_eq!(chosen_title("master", "master", from(url)), "kung-fury");
+        assert_eq!(chosen_title("MASTER", "MASTER", from(url)), "kung-fury", "matched case-blind");
+    }
+
+    #[test]
+    fn a_url_gives_up_its_name_only_when_it_has_one_to_give() {
+        // The segment above the manifest, which is where a name usually sits.
+        assert_eq!(named_by_path("https://cdn.test/hls/kung-fury/master.m3u8").as_deref(), Some("kung-fury"));
+        // Extensions are dropped, and a query string is not part of a name.
+        assert_eq!(named_by_path("https://cdn.test/a/kung-fury.ism/master.m3u8?t=1").as_deref(), Some("kung-fury"));
+        // Nameless segments are skipped as readily as the file itself.
+        assert_eq!(named_by_path("https://cdn.test/kung-fury/stream/index.m3u8").as_deref(), Some("kung-fury"));
+        // Nothing above the file: the host names the site, not the video, so there is no answer —
+        // and `chosen_title` keeps the stub rather than inventing one.
+        assert_eq!(named_by_path("https://cdn.test/master.m3u8"), None);
+        assert_eq!(named_by_path("https://cdn.test/"), None);
+        assert_eq!(named_by_path("not a url at all"), None);
+        // A path of nothing but nameless parts has nothing to offer either.
+        assert_eq!(named_by_path("https://cdn.test/stream/out/index.m3u8"), None);
     }
 
     #[test]
