@@ -243,6 +243,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 [[package]]
 name = "software_inventory"
 version = "0.1.0"
+source = "git+https://github.com/SirHexa10t/software_inventory.git?branch=main#29d022a9936475f4c57d6076ebb4fb1fd48ba2f8"
 
 [[package]]
 name = "strsim"
