@@ -73,8 +73,9 @@ pub struct Env<'a> {
     /// broken or slow IPv6 route stalls each request ~5s on the happy-eyeballs fallback (measured);
     /// `--allow-ipv6` opts back in for an IPv6-only network.
     pub allow_ipv6: bool,
-    /// Embed a cover-art thumbnail. Off by default — a late, idempotent pass handles it, so the
-    /// main download stays fast and a re-run can patch previously-downloaded videos.
+    /// Embed a cover-art thumbnail — what the command line does unless told `--no-thumbnail`. A
+    /// late, idempotent pass handles it, so the main download stays fast and a re-run patches
+    /// previously-downloaded videos; an audio download gets none ([`thumbnails`]).
     pub thumbnail: bool,
     /// Force the subtitle patch pass: scan a video (fresh or already on disk) for its expected
     /// subtitles and embed any that are missing. A fresh download already embeds subtitles
@@ -199,7 +200,7 @@ pub fn download_video(url: &str, into: &Path, env: Env) -> i32 {
     // The subtitle probe and the download are both for a video we don't have yet. If its file is
     // already on disk (id parsed straight from the URL — no yt-dlp call), skip both: subtitle
     // handling rides the download, so there's nothing to probe for. A URL we can't pull an id from
-    // falls back to the probe. The opt-in `--thumbnail` pass below still runs, patching a re-run.
+    // falls back to the probe. The thumbnail pass below still runs, patching a re-run.
     let url_id = id_from_url(url);
     let on_disk = url_id.as_deref().is_some_and(|id| find_by_id(into, id).is_some());
     let mut code = 0;
@@ -246,7 +247,7 @@ pub fn download_video(url: &str, into: &Path, env: Env) -> i32 {
     };
     if code == 0 {
         if let Some(id) = &id {
-            if env.thumbnail {
+            if thumbnails(env) {
                 embed_thumbnails(into, std::slice::from_ref(id));
             }
             if env.subtitles {
@@ -263,29 +264,32 @@ pub fn download_video(url: &str, into: &Path, env: Env) -> i32 {
     code
 }
 
-/// The sites the late `--thumbnail`/`--subtitles` patch passes support — YouTube only, today.
+/// The sites the late thumbnail and `--subtitles` patch passes support — YouTube only, today.
 /// Kept as a list so the generic path's notice names exactly what IS covered as it grows.
 const PATCHABLE_PLATFORMS: &[&str] = &["youtube"];
+
+/// Whether a run embeds thumbnails: unless `--no-thumbnail` said not to, and never in an audio
+/// download — a cover embeds into Matroska video only, and saying so of every audio file a run
+/// fetched would be noise.
+fn thumbnails(env: Env) -> bool {
+    env.thumbnail && !env.audio
+}
 
 /// The generic single-video path for non-YouTube sites (`dl` routes here when the host isn't
 /// YouTube). One download, flat into `into` — a generic page gives no playlist/channel structure
 /// to build folders from — reusing this module's shared argv base (`ytdlp::common`), failure
 /// diagnosis + rescue, ledger, and download archive. No subtitle probing: that's a
-/// YouTube-caption-matrix affair, so a generic site just gets the media, metadata, thumbnail, and
-/// chapters. The URL is the ledger label — the only stable key without a metadata probe (and
-/// enough for `scrub_ledger` when it embeds the id).
+/// YouTube-caption-matrix affair, so a generic site just gets the media, metadata, and chapters —
+/// and no thumbnail, which comes from YouTube's image CDN. The URL is the ledger label — the only
+/// stable key without a metadata probe (and enough for `scrub_ledger` when it embeds the id).
 pub fn download_generic(url: &str, into: &Path, env: Env) -> i32 {
     // The patch passes need a per-video id in the filename and a known thumbnail/caption source —
-    // YouTube-machinery, today. Name what IS supported (the list will grow) instead of silently
-    // ignoring the flag.
-    if env.thumbnail || env.subtitles {
-        let flags = match (env.thumbnail, env.subtitles) {
-            (true, true) => "--thumbnail/--subtitles",
-            (true, false) => "--thumbnail",
-            _ => "--subtitles",
-        };
+    // YouTube-machinery, today. An asked-for `--subtitles` is told what IS supported (the list will
+    // grow) instead of being silently ignored. The thumbnail pass is never asked for — every run
+    // makes it where it can — so a site it cannot serve needs no notice.
+    if env.subtitles {
         eprintln!(
-            "vidl: {flags} supported platforms: {} — skipped for this site",
+            "vidl: --subtitles supported platforms: {} — skipped for this site",
             PATCHABLE_PLATFORMS.join(", ")
         );
     }
@@ -378,9 +382,9 @@ pub fn download_playlist(url: &str, id: &str, into: &Path, env: Env) -> i32 {
             playlist_argv(url, into, home, env, langs, Some(items))
         })
     };
-    // Late thumbnail pass (opt-in) over every playable entry — including archived ones, so a
-    // re-run with `--thumbnail` patches previously-downloaded videos.
-    if env.thumbnail {
+    // Late thumbnail pass over every playable entry — including archived ones, so a re-run
+    // patches previously-downloaded videos.
+    if thumbnails(env) {
         let ids: Vec<String> = scan
             .entries
             .iter()
@@ -551,9 +555,9 @@ pub fn download_channel(root: &str, into: &Path, env: Env) -> i32 {
                 channel_tab_argv(url, tab, into, home, env, langs, items)
             })
         };
-        // Late thumbnail pass (opt-in) over the whole tab — archived entries included, so a re-run
-        // with `--thumbnail` patches previously-downloaded videos.
-        if env.thumbnail {
+        // Late thumbnail pass over the whole tab — archived entries included, so a re-run patches
+        // previously-downloaded videos.
+        if thumbnails(env) {
             let ids: Vec<String> = scan.entries.iter().map(|entry| entry.id.clone()).collect();
             embed_thumbnails(&home, &ids);
         }

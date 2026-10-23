@@ -1,15 +1,17 @@
 //! End-to-end tests of `dl`'s media-patching flags, pinning the agreed behaviour table — which
 //! actions each command performs against each on-disk state ("—" = touch nothing):
 //!
-//! | command                            | not downloaded     | video only          | video+subs | video+thumb | video+thumb+subs |
-//! |------------------------------------|--------------------|---------------------|------------|-------------|------------------|
-//! | `vidl <vid>`                         | dl vid + dl subs   | —                   | —          | —           | —                |
-//! | `vidl <vid> --thumbnail`             | … + dl thumb       | dl thumb            | dl thumb   | —           | —                |
-//! | `vidl <vid> --subtitles`             | dl vid + dl subs   | dl subs             | —          | dl subs     | —                |
-//! | `vidl <vid> --thumbnail --subtitles` | … + dl thumb       | dl subs + dl thumb  | dl thumb   | dl subs     | —                |
+//! | command                                 | not downloaded              | video only         | video+subs | video+thumb | video+thumb+subs |
+//! |-----------------------------------------|-----------------------------|--------------------|------------|-------------|------------------|
+//! | `vidl <vid>`                            | dl vid + dl subs + dl thumb | dl thumb           | dl thumb   | —           | —                |
+//! | `vidl <vid> --no-thumbnail`             | dl vid + dl subs            | —                  | —          | —           | —                |
+//! | `vidl <vid> --subtitles`                | dl vid + dl subs + dl thumb | dl subs + dl thumb | dl thumb   | dl subs     | —                |
+//! | `vidl <vid> --no-thumbnail --subtitles` | dl vid + dl subs            | dl subs            | —          | dl subs     | —                |
 //!
-//! Subtitles ride every real download; thumbnails are opt-in; both flags are late, idempotent
-//! patch passes that ignore the download archive (so a re-run fixes up already-downloaded files).
+//! Subtitles ride every real download. The thumbnail never does: a late pass fetches it, which
+//! every run makes unless `--no-thumbnail`, and `--subtitles` forces a subtitle pass likewise.
+//! Both passes are idempotent and ignore the download archive (so a re-run fixes up
+//! already-downloaded files).
 //!
 //! These tests download from YouTube for real, driving whatever yt-dlp/ffmpeg the PATH offers,
 //! so they are `#[ignore]`d out of the default suite. Run them with:
@@ -130,8 +132,8 @@ fn subs_refused(out: &str) -> bool {
 
 /// Remux `file` in place down to its primary video + audio — dropping subtitles and the attached
 /// cover — manufacturing the table's "video only" state from a fully-dressed file. (The other
-/// intermediate states are reached through the flags themselves: `--thumbnail` on a bare video
-/// yields "video+thumb", a plain download yields "video+subs".)
+/// intermediate states are reached through the flags themselves: a plain run on a bare video
+/// yields "video+thumb", a `--no-thumbnail` download yields "video+subs".)
 fn strip_to_bare(file: &Path) {
     let tmp = file.with_extension("stripped.mkv");
     let mut cmd = Command::new(tool("ffmpeg"));
@@ -151,69 +153,77 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
     let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = scratch("states");
 
-    // not downloaded × `dl` → the video lands with subtitles embedded, and no thumbnail.
-    let out = dl(&dir, &[]);
+    // not downloaded × `--no-thumbnail` → the video lands with subtitles embedded, and no
+    // thumbnail.
+    let out = dl(&dir, &["--no-thumbnail"]);
     let file = video_file(&dir);
     let subs_ok = !subs_refused(&out);
     if subs_ok {
-        assert!(subtitle_count(&file) > 0, "a plain download embeds subtitles:\n{out}");
+        assert!(subtitle_count(&file) > 0, "a download embeds subtitles:\n{out}");
     } else {
         eprintln!("SKIPPED subtitle-content assertions: YouTube 429'd the caption endpoint this run");
     }
-    assert!(!has_thumbnail(&file), "a plain download must not embed a thumbnail:\n{out}");
+    assert!(!has_thumbnail(&file), "`--no-thumbnail` must not embed a thumbnail:\n{out}");
 
-    // video+subs × `dl` → — (skipped outright, file untouched, no patch passes).
+    // video+subs × `--no-thumbnail` → — (skipped outright, file untouched, no patch passes).
     let before = mtime(&file);
-    let out = dl(&dir, &[]);
+    let out = dl(&dir, &["--no-thumbnail"]);
     assert!(out.contains("already downloaded — skipping"), "{out}");
-    assert!(!out.contains("thumbnails:") && !out.contains("subtitles:"), "no passes without flags:\n{out}");
-    assert_eq!(mtime(&file), before, "a plain re-run must not touch the file");
+    assert!(
+        !out.contains("thumbnails:") && !out.contains("subtitles:"),
+        "no passes under `--no-thumbnail`:\n{out}"
+    );
+    assert_eq!(mtime(&file), before, "a `--no-thumbnail` re-run must not touch the file");
 
-    // video+subs × `--thumbnail` → dl thumb (and only that — subtitles stay as they were).
+    // video+subs × `dl` → dl thumb (and only that — subtitles stay as they were).
     let subs = subtitle_count(&file);
-    let out = dl(&dir, &["--thumbnail"]);
+    let out = dl(&dir, &[]);
     assert!(out.contains("missing a thumbnail") && out.contains("embedded"), "{out}");
     assert!(has_thumbnail(&file), "thumbnail patched in:\n{out}");
     assert_eq!(subtitle_count(&file), subs, "the thumbnail pass must not touch subtitles");
 
-    // video+thumb+subs × `--thumbnail` → — (idempotent: seen as present, not re-embedded).
+    // video+thumb+subs × `dl` → — (idempotent: seen as present, not re-embedded).
     let before = mtime(&file);
-    let out = dl(&dir, &["--thumbnail"]);
+    let out = dl(&dir, &[]);
     assert!(out.contains("already has a thumbnail"), "{out}");
     assert_eq!(mtime(&file), before, "no re-embed when the thumbnail is already there");
 
-    // video+thumb+subs × `--subtitles` → — (the forced scan finds every expected track present).
-    // Only meaningful when the subs actually landed; under a caption 429 the state is video+thumb.
+    // video+thumb+subs × `--subtitles` → — (the forced scan finds every expected track present,
+    // the thumbnail pass the cover). Only meaningful when the subs actually landed; under a
+    // caption 429 the state is video+thumb.
     if subs_ok {
         let before = mtime(&file);
         let out = dl(&dir, &["--subtitles"]);
         assert!(out.contains("already downloaded — scanning subtitles"), "{out}");
         assert!(out.contains("expected subtitle(s) already embedded"), "{out}");
         assert!(!out.contains("missing subtitle"), "{out}");
+        assert!(out.contains("already has a thumbnail"), "{out}");
         assert_eq!(mtime(&file), before, "no re-mux when the subtitles are already there");
     }
 
-    // video only × `--thumbnail` → dl thumb (reaching the "video+thumb" state through the flag).
+    // video only × `dl` → dl thumb (reaching the "video+thumb" state through the default).
     strip_to_bare(&file);
     assert_eq!(subtitle_count(&file), 0, "state manufactured: bare video");
     assert!(!has_thumbnail(&file), "state manufactured: bare video");
-    let out = dl(&dir, &["--thumbnail"]);
+    let out = dl(&dir, &[]);
     assert!(out.contains("missing a thumbnail") && out.contains("embedded"), "{out}");
     assert!(has_thumbnail(&file), "thumbnail patched onto the bare video:\n{out}");
     assert_eq!(subtitle_count(&file), 0, "the thumbnail pass must not add subtitles");
 
-    // video+thumb × `--subtitles` → dl subs (and the mux must not drop the cover art).
-    // The patch fetch hits the same throttled endpoint, so it too is gated on captions flowing.
+    // video+thumb × `--no-thumbnail --subtitles` → dl subs (and the mux must not drop the cover
+    // art, which no thumbnail pass is there to put back). The patch fetch hits the same throttled
+    // endpoint, so it too is gated on captions flowing.
     if subs_ok {
-        let out = dl(&dir, &["--subtitles"]);
+        let out = dl(&dir, &["--no-thumbnail", "--subtitles"]);
         assert!(out.contains("missing subtitle(s):") && out.contains("embedded"), "{out}");
+        assert!(!out.contains("thumbnails:"), "no thumbnail pass under `--no-thumbnail`:\n{out}");
         assert!(subtitle_count(&file) > 0, "subtitles patched back in:\n{out}");
         assert!(has_thumbnail(&file), "the subtitle mux must not drop the cover art");
     }
 
-    // video only × `--thumbnail --subtitles` → dl subs + dl thumb.
+    // video only × `--subtitles` → dl subs + dl thumb.
     strip_to_bare(&file);
-    let out = dl(&dir, &["--thumbnail", "--subtitles"]);
+    let out = dl(&dir, &["--subtitles"]);
     assert!(out.contains("missing a thumbnail"), "{out}");
     assert!(out.contains("missing subtitle(s):"), "the probe still names the expected tracks: {out}");
     assert!(has_thumbnail(&file), "the thumbnail half patched:\n{out}");
@@ -224,16 +234,16 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The "not downloaded" column with both flags: one run lands the video with subtitles (which
-/// ride the download itself — fetched once, so the forced scan then finds nothing missing) and
-/// the thumbnail (which never rides a download — its pass fetches it).
+/// The "not downloaded" column: one run lands the video with subtitles (which ride the download
+/// itself — fetched once, so the scan `--subtitles` forces then finds nothing missing) and the
+/// thumbnail (which never rides a download — its pass fetches it).
 #[test]
 #[ignore = "network: downloads from YouTube; needs the bundled yt-dlp/ffmpeg/deno"]
-fn a_fresh_download_with_both_flags_lands_video_subs_and_thumbnail_in_one_run() {
+fn a_fresh_download_lands_video_subs_and_thumbnail_in_one_run() {
     let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = scratch("fresh_both");
 
-    let out = dl(&dir, &["--thumbnail", "--subtitles"]);
+    let out = dl(&dir, &["--subtitles"]);
     let file = video_file(&dir);
     assert!(has_thumbnail(&file), "the thumbnail pass ran after the download:\n{out}");
     assert!(out.contains("missing a thumbnail"), "the thumbnail is never part of the download:\n{out}");

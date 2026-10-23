@@ -73,11 +73,13 @@ pub(crate) fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) 
     let stamped = file.with_extension("stamping.mkv");
     let mut argv: Vec<OsString> = ["-nostdin", "-v", "error", "-y", "-i"].map(OsString::from).to_vec();
     argv.push(file.as_os_str().to_owned());
-    // NOTE: a bare `-map 0 -c copy` remux DEMOTES an attached cover (see [`mux_subtitles`],
-    // which extracts and re-attaches for exactly that reason). Safe here only by call order:
-    // this runs straight after a fresh download, before any `--thumbnail` pass could have
-    // attached one — keep it that way, or adopt the mux's cover-carry.
+    // A bare `-map 0 -c copy` remux DEMOTES an attached cover, so the covers are carried through
+    // ([`CoverCarry`]). This used to rest on call order alone — straight after a fresh download,
+    // before any thumbnail pass — which a file already on disk but missing from the archive
+    // breaks: yt-dlp calls it "already downloaded", and the finishing pass stamps it, cover and all.
+    let carry = embedded(&file).map(|embedded| CoverCarry::take(&file, &embedded)).unwrap_or_default();
     argv.extend(["-map", "0", "-c", "copy"].map(OsString::from));
+    argv.extend(carry.args());
     for (order, title) in &retitle {
         argv.push(format!("-metadata:s:s:{order}").into());
         argv.push(format!("title={title}").into());
@@ -85,6 +87,7 @@ pub(crate) fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) 
     argv.push(stamped.as_os_str().to_owned());
     let renamed = crate::util::exec::run_ok(&ffmpeg, &argv)
         && std::fs::rename(&stamped, &file).is_ok();
+    carry.clean();
     if renamed {
         for (_, title) in &retitle {
             println!("stamped subtitle track: {title}");
@@ -288,54 +291,107 @@ fn stamped_title(name: &str) -> String {
     format!("{} (auto-generated)", name.replace(" (Original)", ""))
 }
 
-/// The absolute stream index of the embedded cover in an ffprobe
-/// `stream=index:stream_disposition=attached_pic -of default=nw=1` listing (`index=N` lines, each
-/// followed by its dispositions), or `None` when no stream carries `attached_pic=1`. Pure, so the
-/// idempotency gate and the remux cover-carry are unit-tested without ffprobe.
-fn attached_pic_stream_index(listing: &str) -> Option<u32> {
-    let mut current = None;
-    for line in listing.lines() {
-        if let Some(index) = line.strip_prefix("index=") {
-            current = index.trim().parse().ok();
-        } else if line.trim() == "DISPOSITION:attached_pic=1" {
-            return current;
-        }
-    }
-    None
+/// A cover a file embeds: its absolute stream index, its image codec (`mjpeg`, `png`), and how it
+/// sits there — attached, as a Matroska cover should be (ffprobe's `attached_pic`), or demoted by
+/// an earlier remux to a plain video track: still the picture, still tagged with the image type
+/// it was attached as, but no longer marked a cover, so thumbnailers pass it over and players
+/// list it as one more video.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbeddedCover {
+    index: u32,
+    codec: String,
+    demoted: bool,
 }
 
-/// The absolute stream index of `file`'s embedded thumbnail: `Some(Some(idx))` when one exists,
-/// `Some(None)` when none does, `None` when ffprobe couldn't run — the caller then leaves the
+/// What a file embeds that a remux has to mind: its covers, and how many attachments `-map 0`
+/// carries on its own (a font, an info json) — a cover attached again lands after those.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Embedded {
+    covers: Vec<EmbeddedCover>,
+    attachments: usize,
+}
+
+/// [`Embedded`] as read off an ffprobe `stream=index,codec_name,codec_type:stream_disposition=
+/// attached_pic:stream_tags=mimetype -of default=nw=1` listing (`index=N` opening each stream).
+/// A demoted cover is a video stream with an `image/…` mimetype — only an attachment is given
+/// one — and its tag arrives uppercase (`TAG:MIMETYPE=`), as Matroska stores a track's tags.
+/// Pure, so the idempotency gate and the remux cover-carry are unit-tested without ffprobe.
+fn embedded_in(listing: &str) -> Embedded {
+    #[derive(Default)]
+    struct Seen {
+        index: Option<u32>,
+        codec: String,
+        kind: String,
+        attached: bool,
+        image: bool,
+    }
+    let mut embedded = Embedded::default();
+    let mut tally = |seen: &Seen| match (seen.index, seen.kind.as_str()) {
+        (Some(index), "video") if seen.attached || seen.image => embedded.covers.push(EmbeddedCover {
+            index,
+            codec: seen.codec.clone(),
+            demoted: !seen.attached,
+        }),
+        (Some(_), "attachment") => embedded.attachments += 1,
+        _ => {}
+    };
+    let mut seen = Seen::default();
+    for line in listing.lines().map(str::trim) {
+        if let Some(index) = line.strip_prefix("index=") {
+            tally(&seen);
+            seen = Seen { index: index.parse().ok(), ..Seen::default() };
+        } else if let Some(codec) = line.strip_prefix("codec_name=") {
+            seen.codec = codec.to_string();
+        } else if let Some(kind) = line.strip_prefix("codec_type=") {
+            seen.kind = kind.to_string();
+        } else if line == "DISPOSITION:attached_pic=1" {
+            seen.attached = true;
+        } else if let Some((key, value)) = line.strip_prefix("TAG:").and_then(|tag| tag.split_once('=')) {
+            seen.image |= key.eq_ignore_ascii_case("mimetype") && value.starts_with("image/");
+        }
+    }
+    tally(&seen);
+    embedded
+}
+
+/// What `file` embeds ([`Embedded`]); `None` when ffprobe couldn't run — the caller then leaves the
 /// file untouched rather than guess.
-fn embedded_thumbnail_index(file: &Path) -> Option<Option<u32>> {
+fn embedded(file: &Path) -> Option<Embedded> {
     let ffprobe = crate::tools::ffprobe();
     let listing = capture_stdout(
         &ffprobe,
         [
             OsString::from("-v"), "error".into(),
-            "-show_entries".into(), "stream=index:stream_disposition=attached_pic".into(),
+            "-show_entries".into(),
+            "stream=index,codec_name,codec_type:stream_disposition=attached_pic:stream_tags=mimetype".into(),
             "-of".into(), "default=nw=1".into(),
             file.as_os_str().to_owned(),
         ],
     )?;
-    Some(attached_pic_stream_index(&listing))
+    Some(embedded_in(&listing))
 }
 
-/// Whether `file` already carries an embedded thumbnail. `None` when ffprobe couldn't run.
-fn has_embedded_thumbnail(file: &Path) -> Option<bool> {
-    Some(embedded_thumbnail_index(file)?.is_some())
+/// The extension and mimetype a cover in `codec` is extracted and attached as — `None` for an image
+/// type Matroska keeps no cover in. vidl's own are always JPEG: both `dl`'s pass and yt-dlp's legacy
+/// inline embeds convert to jpg; PNG is here for covers from elsewhere.
+fn cover_type(codec: &str) -> Option<(&'static str, &'static str)> {
+    match codec {
+        "mjpeg" => Some(("jpg", "image/jpeg")),
+        "png" => Some(("png", "image/png")),
+        _ => None,
+    }
 }
 
-/// Pull the attached cover (stream `index`) out of `file` — a one-packet stream copy into a temp
-/// `.jpg` beside it — so a remux can re-`-attach` it. Covers here are always JPEG: both `dl`'s
-/// own pass and yt-dlp's legacy inline embeds convert to jpg. `None` (temp cleaned) on failure.
-fn extract_thumbnail(file: &Path, index: u32) -> Option<PathBuf> {
+/// Pull `cover` out of `file` — a one-packet stream copy into a temp file beside it — so a remux can
+/// re-`-attach` it. `None` (temp cleaned) on failure.
+fn extract_cover(file: &Path, cover: &EmbeddedCover) -> Option<PathBuf> {
+    let (ext, _) = cover_type(&cover.codec)?;
     let ffmpeg = crate::tools::ffmpeg();
-    let tmp = file.with_extension("cover-keep.jpg");
+    let tmp = file.with_extension(format!("cover-keep-{}.{ext}", cover.index));
     let mut argv: Vec<OsString> = ["-nostdin", "-v", "error", "-y", "-i"].map(OsString::from).to_vec();
     argv.push(file.as_os_str().to_owned());
     argv.push("-map".into());
-    argv.push(format!("0:{index}").into());
+    argv.push(format!("0:{}", cover.index).into());
     argv.extend(["-frames:v", "1", "-c", "copy"].map(OsString::from));
     argv.push(tmp.as_os_str().to_owned());
     let ok = crate::util::exec::run_ok(&ffmpeg, &argv) && tmp.is_file();
@@ -345,6 +401,93 @@ fn extract_thumbnail(file: &Path, index: u32) -> Option<PathBuf> {
         let _ = std::fs::remove_file(&tmp);
         None
     }
+}
+
+/// The covers a remux of a file carries through. A cover can't just ride `-map 0` — the remux
+/// demotes it to a plain video track (the `attached_pic` disposition doesn't survive an mkv
+/// round-trip) — so each is extracted first, left out of the map, and re-`-attach`ed in the same
+/// pass; a demoted one is restored with them. A picture embedded twice (the old, demoted copy and
+/// a fresh one beside it) is carried once; a different second picture is kept, named so the first
+/// stays the one thumbnailers show. A cover that won't come out stays mapped — demoted, as before
+/// this carry existed, but kept.
+#[derive(Debug, Default)]
+struct CoverCarry {
+    /// Cover streams left out of the map: each extracted, or a copy of one that was.
+    excluded: Vec<u32>,
+    /// The extracted pictures, each with the file name and mimetype it is attached under.
+    attached: Vec<(PathBuf, String, &'static str)>,
+    /// The attachments `-map 0` carries itself, numbered ahead of the re-attached covers.
+    mapped_attachments: usize,
+}
+
+impl CoverCarry {
+    /// Extracts the covers `embedded` lists out of `file`, attached ones first.
+    fn take(file: &Path, embedded: &Embedded) -> CoverCarry {
+        let mut carry = CoverCarry { mapped_attachments: embedded.attachments, ..CoverCarry::default() };
+        let mut covers: Vec<&EmbeddedCover> = embedded.covers.iter().collect();
+        covers.sort_by_key(|cover| cover.demoted);
+        let mut taken: Vec<Vec<u8>> = Vec::new();
+        for cover in covers {
+            let Some(tmp) = extract_cover(file, cover) else { continue };
+            let bytes = std::fs::read(&tmp).unwrap_or_default();
+            carry.excluded.push(cover.index);
+            if taken.contains(&bytes) {
+                let _ = std::fs::remove_file(&tmp);
+                continue;
+            }
+            let (ext, mimetype) = cover_type(&cover.codec).expect("extracted, so a known type");
+            let name = match carry.attached.len() {
+                0 => format!("cover.{ext}"),
+                n => format!("cover-{}.{ext}", n + 1),
+            };
+            taken.push(bytes);
+            carry.attached.push((tmp, name, mimetype));
+        }
+        carry
+    }
+
+    /// The options carrying the covers, for after a remux's `-map 0`: their streams left out of it,
+    /// and each attached again — named and typed, as attachment number `mapped_attachments + n`.
+    fn args(&self) -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::new();
+        for index in &self.excluded {
+            args.push("-map".into());
+            args.push(format!("-0:{index}").into());
+        }
+        for (number, (tmp, name, mimetype)) in self.attached.iter().enumerate() {
+            let tag = format!("-metadata:s:t:{}", self.mapped_attachments + number);
+            args.push("-attach".into());
+            args.push(tmp.as_os_str().to_owned());
+            args.extend([tag.clone(), format!("mimetype={mimetype}"), tag, format!("filename={name}")].map(OsString::from));
+        }
+        args
+    }
+
+    /// Remove the extracted pictures — they were only for the re-attach.
+    fn clean(self) {
+        for (tmp, ..) in self.attached {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+/// Restore `file`'s demoted covers in place: one stream-copy remux carrying every cover through
+/// ([`CoverCarry`]) and changing nothing else. Renames over the original. Returns success.
+fn repair_covers(file: &Path, embedded: &Embedded) -> bool {
+    let ffmpeg = crate::tools::ffmpeg();
+    let carry = CoverCarry::take(file, embedded);
+    let out = file.with_extension("covering.mkv");
+    let mut argv: Vec<OsString> = ["-nostdin", "-v", "error", "-y", "-i"].map(OsString::from).to_vec();
+    argv.push(file.as_os_str().to_owned());
+    argv.extend(["-map", "0", "-c", "copy"].map(OsString::from));
+    argv.extend(carry.args());
+    argv.push(out.as_os_str().to_owned());
+    let ok = !carry.excluded.is_empty() && crate::util::exec::run_ok(&ffmpeg, &argv) && std::fs::rename(&out, file).is_ok();
+    carry.clean();
+    if !ok {
+        let _ = std::fs::remove_file(&out);
+    }
+    ok
 }
 
 /// Fetch YouTube video `id`'s thumbnail to `dest` (a `.jpg`), best quality first: `maxresdefault`
@@ -367,19 +510,19 @@ fn fetch_youtube_thumbnail(id: &str, dest: &Path) -> bool {
 }
 
 /// Attach `thumb` into the mkv `file` as cover art (an mkv attachment, exactly as yt-dlp embeds
-/// it), keeping every existing stream (`-map 0 -c copy`). Writes a sibling temp file and renames
-/// over the original. Returns whether it succeeded.
+/// it), keeping every existing stream (`-map 0 -c copy`) — for a file with no cover yet, so there is
+/// none to carry. The new attachment is numbered after those the file already has, which `-map 0`
+/// puts first. Writes a sibling temp file and renames over the original. Returns whether it
+/// succeeded.
 fn attach_thumbnail(file: &Path, thumb: &Path) -> bool {
     let ffmpeg = crate::tools::ffmpeg();
     let out = file.with_extension("thumbing.mkv");
+    let tag = format!("-metadata:s:t:{}", embedded(file).map_or(0, |embedded| embedded.attachments));
     let mut argv: Vec<OsString> = ["-nostdin", "-v", "error", "-y", "-i"].map(OsString::from).to_vec();
     argv.push(file.as_os_str().to_owned());
     argv.extend(["-map", "0", "-c", "copy", "-attach"].map(OsString::from));
     argv.push(thumb.as_os_str().to_owned());
-    argv.extend(
-        ["-metadata:s:t:0", "mimetype=image/jpeg", "-metadata:s:t:0", "filename=cover.jpg"]
-            .map(OsString::from),
-    );
+    argv.extend([tag.clone(), "mimetype=image/jpeg".to_string(), tag, "filename=cover.jpg".to_string()].map(OsString::from));
     argv.push(out.as_os_str().to_owned());
     let ok = crate::util::exec::run_ok(&ffmpeg, &argv) && std::fs::rename(&out, file).is_ok();
     if !ok {
@@ -396,12 +539,15 @@ fn embed_one_thumbnail(file: &Path, id: &str) -> bool {
     ok
 }
 
-/// The late, opt-in (`--thumbnail`) cover-art pass: for each video `id` under `dir`, scan and
-/// report whether it already has an embedded thumbnail — so the user sees up front what's missing
-/// rather than waiting on unbounded work — then fetch + embed only the ones lacking one.
+/// The late cover-art pass, which a run makes unless `--no-thumbnail`: for each video `id` under
+/// `dir`, scan and report whether it already has an embedded thumbnail — so the user sees up front
+/// what's missing rather than waiting on unbounded work — then fetch + embed only the ones lacking
+/// one.
 /// Deliberately independent of the download archive, so a re-run *patches* previously-downloaded
 /// videos; the embedded-thumbnail check keeps it idempotent (a video that already has one is never
-/// re-fetched or re-embedded).
+/// re-fetched or re-embedded). A thumbnail an earlier remux demoted to a plain video track is no
+/// missing one: it is restored in place ([`repair_covers`]) — no fetch, and no second cover beside
+/// it.
 pub(crate) fn embed_thumbnails(dir: &Path, ids: &[String]) {
     if ids.is_empty() {
         return;
@@ -417,9 +563,18 @@ pub(crate) fn embed_thumbnails(dir: &Path, ids: &[String]) {
             Some(file) if !is_mkv(&file) => {
                 println!("  [{id}]: {}", style::problematic("not an mkv — cover art embeds into video (mkv) only; skipping"));
             }
-            Some(file) => match has_embedded_thumbnail(&file) {
-                Some(true) => println!("  [{id}]: {}", style::approved("already has a thumbnail")),
-                Some(false) => {
+            Some(file) => match embedded(&file) {
+                Some(embedded) if embedded.covers.iter().any(|cover| cover.demoted) => {
+                    if repair_covers(&file, &embedded) {
+                        println!("  [{id}]: {}", style::approved("thumbnail restored (a remux had made a plain video track of it)"));
+                    } else {
+                        eprintln!("  [{id}]: {}", style::problematic("could not restore its thumbnail"));
+                    }
+                }
+                Some(embedded) if !embedded.covers.is_empty() => {
+                    println!("  [{id}]: {}", style::approved("already has a thumbnail"));
+                }
+                Some(_) => {
                     println!("  [{id}]: {}", style::problematic("missing a thumbnail"));
                     missing.push((id.clone(), file));
                 }
@@ -505,16 +660,12 @@ fn fetch_subtitles(url: &str, id: &str, keys: &[String], into: &Path, env: Env) 
 
 /// Mux the arrived subtitle sidecars into the mkv `file` in one ffmpeg pass, keeping every existing
 /// stream and tagging each new track's language + title. `existing` is the file's current subtitle
-/// count, so the new tracks land at the right output indices. An attached cover can't just ride
-/// `-map 0` — a remux demotes it to a plain video track (the `attached_pic` disposition doesn't
-/// survive an mkv round-trip) — so it's extracted first, excluded from the map, and re-`-attach`ed
-/// in the same pass. Renames over the original. Returns success.
+/// count, so the new tracks land at the right output indices. Its covers are carried through
+/// ([`CoverCarry`]): a remux would otherwise demote them. Renames over the original. Returns
+/// success.
 fn mux_subtitles(file: &Path, arrived: &[(&Pick, PathBuf)], existing: usize) -> bool {
     let ffmpeg = crate::tools::ffmpeg();
-    let cover_index = embedded_thumbnail_index(file).flatten();
-    // Extraction failing (odd, but possible) degrades to the old demote-the-cover behaviour —
-    // the exclusion below is applied only when the re-attach is actually in hand.
-    let cover = cover_index.and_then(|index| extract_thumbnail(file, index));
+    let carry = embedded(file).map(|embedded| CoverCarry::take(file, &embedded)).unwrap_or_default();
     let out = file.with_extension("subbing.mkv");
     let mut argv: Vec<OsString> = ["-nostdin", "-v", "error", "-y", "-i"].map(OsString::from).to_vec();
     argv.push(file.as_os_str().to_owned());
@@ -522,26 +673,13 @@ fn mux_subtitles(file: &Path, arrived: &[(&Pick, PathBuf)], existing: usize) -> 
         argv.push("-i".into());
         argv.push(sidecar.as_os_str().to_owned());
     }
-    if let Some(tmp) = &cover {
-        argv.push("-attach".into());
-        argv.push(tmp.as_os_str().to_owned());
-    }
     argv.extend(["-map", "0"].map(OsString::from));
-    if let (Some(index), Some(_)) = (cover_index, &cover) {
-        argv.push("-map".into());
-        argv.push(format!("-0:{index}").into());
-    }
     for input in 1..=arrived.len() {
         argv.push("-map".into());
         argv.push(input.to_string().into());
     }
     argv.extend(["-c", "copy", "-c:s", "srt"].map(OsString::from));
-    if cover.is_some() {
-        argv.extend(
-            ["-metadata:s:t:0", "mimetype=image/jpeg", "-metadata:s:t:0", "filename=cover.jpg"]
-                .map(OsString::from),
-        );
-    }
+    argv.extend(carry.args());
     for (offset, (pick, _)) in arrived.iter().enumerate() {
         let idx = existing + offset;
         let lang = pick.key.split('-').next().unwrap_or(&pick.key);
@@ -552,9 +690,7 @@ fn mux_subtitles(file: &Path, arrived: &[(&Pick, PathBuf)], existing: usize) -> 
     }
     argv.push(out.as_os_str().to_owned());
     let ok = crate::util::exec::run_ok(&ffmpeg, &argv) && std::fs::rename(&out, file).is_ok();
-    if let Some(tmp) = &cover {
-        let _ = std::fs::remove_file(tmp); // the extracted cover was only for the re-attach
-    }
+    carry.clean();
     if !ok {
         let _ = std::fs::remove_file(&out);
     }
@@ -847,13 +983,19 @@ mod tests {
     }
 
     #[test]
-    fn the_attached_pic_index_is_read_from_ffprobes_stream_listing() {
-        // `index=N` lines each followed by that stream's dispositions (default=nw=1 layout).
-        let with_cover = "index=0\nDISPOSITION:attached_pic=0\nindex=1\nDISPOSITION:attached_pic=0\nindex=2\nDISPOSITION:attached_pic=1";
-        assert_eq!(attached_pic_stream_index(with_cover), Some(2), "the cover's absolute index");
-        let without = "index=0\nDISPOSITION:attached_pic=0\nindex=1\nDISPOSITION:attached_pic=0";
-        assert_eq!(attached_pic_stream_index(without), None, "video+audio, no cover");
-        assert_eq!(attached_pic_stream_index(""), None, "no streams");
+    fn covers_are_read_from_ffprobes_stream_listing_attached_or_demoted() {
+        // `index=N` opening each stream's lines (default=nw=1 layout): a cover is attached by its
+        // disposition, or demoted but still typed as an image — the tag then a track's, uppercase.
+        let video = "index=0\ncodec_name=h264\ncodec_type=video\nDISPOSITION:attached_pic=0\n";
+        let audio = "index=1\ncodec_name=aac\ncodec_type=audio\nDISPOSITION:attached_pic=0\n";
+        let attached = "index=2\ncodec_name=mjpeg\ncodec_type=video\nDISPOSITION:attached_pic=1\nTAG:mimetype=image/jpeg\n";
+        let demoted = "index=3\ncodec_name=mjpeg\ncodec_type=video\nDISPOSITION:attached_pic=0\nTAG:MIMETYPE=image/jpeg\n";
+        let font = "index=4\ncodec_type=attachment\nDISPOSITION:attached_pic=0\nTAG:mimetype=application/x-truetype-font\n";
+        let listing = [video, audio, attached, demoted, font].concat();
+        let cover = |index, demoted| EmbeddedCover { index, codec: "mjpeg".to_string(), demoted };
+        assert_eq!(embedded_in(&listing), Embedded { covers: vec![cover(2, false), cover(3, true)], attachments: 1 });
+        assert_eq!(embedded_in(&[video, audio].concat()), Embedded::default(), "video+audio, no cover");
+        assert_eq!(embedded_in(""), Embedded::default(), "no streams");
     }
 
     #[test]
@@ -993,11 +1135,11 @@ mod tests {
             .is_ok_and(|status| status.success());
         assert!(ok, "could not build the cover");
 
-        assert_eq!(has_embedded_thumbnail(&file), Some(false), "starts bare");
+        assert_eq!(embedded(&file).expect("probe works").covers, [], "starts bare");
         assert!(attach_thumbnail(&file, &cover), "attach succeeds");
-        assert_eq!(has_embedded_thumbnail(&file), Some(true), "probe sees the cover");
-        let index = embedded_thumbnail_index(&file).flatten().expect("cover index");
-        let out = extract_thumbnail(&file, index).expect("extracts back out");
+        let covers = embedded(&file).expect("probe works").covers;
+        assert!(matches!(covers.as_slice(), [only] if !only.demoted), "probe sees the cover, attached: {covers:?}");
+        let out = extract_cover(&file, &covers[0]).expect("extracts back out");
         assert!(std::fs::metadata(&out).unwrap().len() > 0, "extracted cover has bytes");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1026,7 +1168,8 @@ mod tests {
 
         let (count, titles) = subtitle_streams(&file).expect("probe works");
         assert_eq!((count, titles), (1, vec!["English".to_string()]), "the track landed, titled");
-        assert_eq!(has_embedded_thumbnail(&file), Some(true), "the cover survived the remux");
+        let covers = embedded(&file).expect("probe works").covers;
+        assert!(matches!(covers.as_slice(), [only] if !only.demoted), "the cover survived the remux, attached: {covers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1050,6 +1193,208 @@ mod tests {
         mark_auto_titles(&dir, "abcdefghijk", std::slice::from_ref(&auto), Env::default());
         let (_, titles) = subtitle_streams(&file).expect("probe works");
         assert_eq!(titles, ["English (auto-generated)"], "the machine origin is stamped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A small cover image at `path`, in `color` — distinct colors make distinct pictures.
+    fn build_cover(path: &Path, color: &str) {
+        let ok = std::process::Command::new(ff_bin("ffmpeg")).stdin(std::process::Stdio::null())
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", &format!("color=c={color}:s=32x32:d=1"), "-frames:v", "1"])
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(ok, "could not build the cover");
+    }
+
+    /// What every other remux did to a cover before the carry: a bare `-map 0 -c copy`, which leaves
+    /// it a plain video track.
+    fn demote_covers(file: &Path) {
+        let tmp = file.with_extension("demoting.mkv");
+        let ok = std::process::Command::new(ff_bin("ffmpeg")).stdin(std::process::Stdio::null())
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(file)
+            .args(["-map", "0", "-c", "copy"])
+            .arg(&tmp)
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(ok && std::fs::rename(&tmp, file).is_ok(), "could not demote the cover");
+    }
+
+    /// Each stream of `file` as `type,attached_pic[,filename,mimetype]`.
+    fn stream_rows(file: &Path) -> Vec<String> {
+        let listing = capture_stdout(
+            ff_bin("ffprobe"),
+            [
+                OsString::from("-v"), "error".into(),
+                "-show_entries".into(), "stream=codec_type:stream_disposition=attached_pic:stream_tags=filename,mimetype".into(),
+                "-of".into(), "csv=p=0".into(),
+                file.as_os_str().to_owned(),
+            ],
+        )
+        .expect("ffprobe runs");
+        listing.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn stamping_a_file_that_has_a_cover_keeps_it_attached() {
+        // The case that used to demote it: the finishing pass reaching a file already on disk —
+        // missing from the archive, so yt-dlp called it "already downloaded" — with its cover.
+        if !ffmpeg_or_skip("stamping a covered file") {
+            return;
+        }
+        let dir = scratch_dir("stampcover");
+        let file = dir.join("v__abcdefghijk.mkv");
+        build_test_mkv(&file);
+        let cover = dir.join("cover.jpg");
+        build_cover(&cover, "red");
+        assert!(attach_thumbnail(&file, &cover));
+        let sidecar = dir.join("v.en.vtt");
+        std::fs::write(&sidecar, "WEBVTT\n\n00:00.000 --> 00:01.000\nhi\n").unwrap();
+        let plain = Pick { key: "en".into(), name: "English".into(), auto: false };
+        assert!(mux_subtitles(&file, &[(&plain, sidecar)], 0));
+
+        let auto = Pick { key: "en".into(), name: "English".into(), auto: true };
+        mark_auto_titles(&dir, "abcdefghijk", std::slice::from_ref(&auto), Env::default());
+        let (_, titles) = subtitle_streams(&file).expect("probe works");
+        assert_eq!(titles, ["English (auto-generated)"], "stamped");
+        let covers = embedded(&file).expect("probe works").covers;
+        assert!(matches!(covers.as_slice(), [only] if !only.demoted), "the cover stayed a cover: {covers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_thumbnail_pass_restores_a_demoted_cover_without_fetching_another() {
+        // A demoted cover is no missing one: restored in place, the same picture — a fetch would
+        // bring YouTube's (or fail, offline), and leave the old one beside it as a second track.
+        if !ffmpeg_or_skip("restoring a demoted cover") {
+            return;
+        }
+        let dir = scratch_dir("restorecover");
+        let file = dir.join("v__abcdefghijk.mkv");
+        build_test_mkv(&file);
+        let cover = dir.join("cover.jpg");
+        build_cover(&cover, "red");
+        assert!(attach_thumbnail(&file, &cover));
+        demote_covers(&file);
+        let demoted = embedded(&file).expect("probe works").covers;
+        assert!(matches!(demoted.as_slice(), [only] if only.demoted), "set-up: demoted: {demoted:?}");
+
+        embed_thumbnails(&dir, &["abcdefghijk".to_string()]);
+        let covers = embedded(&file).expect("probe works").covers;
+        assert!(matches!(covers.as_slice(), [only] if !only.demoted), "one cover, attached again: {covers:?}");
+        let out = extract_cover(&file, &covers[0]).expect("extracts");
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&cover).unwrap(), "the very picture it had");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".cover-keep-") || name.ends_with(".covering.mkv"))
+            .collect();
+        assert_eq!(leftovers, [out.file_name().unwrap().to_string_lossy().into_owned()], "no temp file but the test's own extract");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_doubled_cover_is_carried_once_and_a_different_one_kept_second() {
+        // The double a fetch beside a demoted cover left: the same picture twice comes out as one
+        // cover; a different second picture is kept, named so the first stays the one shown.
+        if !ffmpeg_or_skip("doubled covers") {
+            return;
+        }
+        let dir = scratch_dir("doublecover");
+        let red = dir.join("red.jpg");
+        build_cover(&red, "red");
+        let green = dir.join("green.jpg");
+        build_cover(&green, "green");
+        for (second, kept) in [(&red, vec!["cover.jpg"]), (&green, vec!["cover.jpg", "cover-2.jpg"])] {
+            let file = dir.join("v__abcdefghijk.mkv");
+            build_test_mkv(&file);
+            assert!(attach_thumbnail(&file, &red));
+            demote_covers(&file);
+            assert!(attach_thumbnail(&file, second), "the fetch's new cover beside the demoted one");
+
+            embed_thumbnails(&dir, &["abcdefghijk".to_string()]);
+            let covers = embedded(&file).expect("probe works").covers;
+            assert!(covers.iter().all(|cover| !cover.demoted), "{covers:?}");
+            let names: Vec<String> = stream_rows(&file)
+                .iter()
+                .filter(|row| row.starts_with("video,1,"))
+                .map(|row| row.split(',').nth(2).unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(names, kept, "second cover {}", second.display());
+            // `cover.jpg`, the name thumbnailers prefer, is the cover that was attached already.
+            let shown = extract_cover(&file, &covers[0]).expect("extracts");
+            assert_eq!(std::fs::read(&shown).unwrap(), std::fs::read(second).unwrap(), "second cover {}", second.display());
+            let _ = std::fs::remove_file(&shown);
+            let _ = std::fs::remove_file(&file);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_demoted_cover_that_does_not_come_out_is_left_as_it_is() {
+        // A cover in an image type vidl keeps no covers in (here GIF: they are JPEG, PNG for ones
+        // from elsewhere) is not extracted to attach again: the file is left untouched, not
+        // rewritten for nothing and called restored.
+        if !ffmpeg_or_skip("an unextractable cover") {
+            return;
+        }
+        let dir = scratch_dir("gifcover");
+        let plain = dir.join("plain.mkv");
+        build_test_mkv(&plain);
+        let file = dir.join("v__abcdefghijk.mkv");
+        let ok = std::process::Command::new(ff_bin("ffmpeg")).stdin(std::process::Stdio::null())
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(&plain)
+            .args(["-f", "lavfi", "-i", "color=c=red:s=32x32:d=1"])
+            .args(["-map", "0", "-map", "1", "-c", "copy", "-c:v:1", "gif", "-frames:v:1", "1", "-metadata:s:v:1", "mimetype=image/gif"])
+            .arg(&file)
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(ok, "could not build the file");
+        let covers = embedded(&file).expect("probe works").covers;
+        assert!(matches!(covers.as_slice(), [only] if only.demoted && only.codec == "gif"), "set-up: {covers:?}");
+        let before = std::fs::read(&file).unwrap();
+
+        embed_thumbnails(&dir, &["abcdefghijk".to_string()]);
+        assert_eq!(std::fs::read(&file).unwrap(), before, "the file is left as it was");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_carried_cover_is_attached_after_the_files_own_attachments() {
+        // `-map 0` carries a font itself, numbered first: the re-attached cover's name and type go
+        // to the attachment after it — not over the font's.
+        if !ffmpeg_or_skip("cover beside a font") {
+            return;
+        }
+        let dir = scratch_dir("fontcover");
+        let file = dir.join("v__abcdefghijk.mkv");
+        build_test_mkv(&file);
+        let font = dir.join("font.ttf");
+        std::fs::write(&font, "not really a font").unwrap();
+        let fonted = dir.join("fonted.mkv");
+        let ok = std::process::Command::new(ff_bin("ffmpeg")).stdin(std::process::Stdio::null())
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(&file)
+            .args(["-map", "0", "-c", "copy", "-attach"])
+            .arg(&font)
+            .args(["-metadata:s:t:0", "mimetype=application/x-truetype-font", "-metadata:s:t:0", "filename=font.ttf"])
+            .arg(&fonted)
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(ok && std::fs::rename(&fonted, &file).is_ok(), "could not attach the font");
+        let cover = dir.join("cover.jpg");
+        build_cover(&cover, "red");
+        assert!(attach_thumbnail(&file, &cover), "a cover numbered after the font");
+
+        let sidecar = dir.join("v.en.vtt");
+        std::fs::write(&sidecar, "WEBVTT\n\n00:00.000 --> 00:01.000\nhi\n").unwrap();
+        let pick = Pick { key: "en".into(), name: "English".into(), auto: false };
+        assert!(mux_subtitles(&file, &[(&pick, sidecar)], 0), "the mux carries the cover past the font");
+        let rows = stream_rows(&file);
+        assert!(rows.contains(&"attachment,0,font.ttf,application/x-truetype-font".to_string()), "the font as it was: {rows:?}");
+        assert!(rows.contains(&"video,1,cover.jpg,image/jpeg".to_string()), "the cover, attached: {rows:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

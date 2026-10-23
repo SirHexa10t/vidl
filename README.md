@@ -52,9 +52,13 @@ requested, with auto-generated tracks retitled so `English (auto-generated)` can
 the uploader's own. On `--audio`, where the container has nowhere to put a subtitle *stream*, the
 text is written into metadata tags instead.
 
-**Idempotent patch passes.** `--thumbnail` and `--subtitles` skip files that already have what
-they'd add, and deliberately ignore the download archive, so pointing them at an existing library
-patches it in place rather than re-downloading it.
+**Idempotent patch passes.** The thumbnail pass — every YouTube video run's, unless
+`--no-thumbnail` — and `--subtitles` skip files that already have what they'd add, and
+deliberately ignore the download archive, so pointing a run at an existing library patches it in
+place rather than re-downloading it: the first run over videos downloaded without thumbnails
+embeds one into each. Every pass that rewrites a file carries its cover through as cover art; a
+cover an earlier remux turned into a plain video track — which players list as one more video and
+thumbnailers ignore — is restored by the thumbnail pass, without fetching another.
 
 **Names that fit.** Many sites put a whole post caption in the video's title, which is how a
 "title" of several hundred characters reaches a filesystem that refuses any path component over

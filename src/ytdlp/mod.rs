@@ -349,7 +349,7 @@ mod tests {
         // The name record is unconditional, though: every download must be able to say what it
         // was called, whatever else the run asked for.
         assert!(bare.iter().any(|arg| arg == "--print-to-file"), "the name record is not optional");
-        // Thumbnails are a late opt-in pass now, never inline in the download argv.
+        // Thumbnails are a late pass, never inline in the download argv.
         assert!(!text.iter().any(|a| a == "--embed-thumbnail"), "thumbnail must not be inline");
     }
 

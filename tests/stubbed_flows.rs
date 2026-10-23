@@ -176,7 +176,9 @@ fn ffmpeg_or_skip(test: &str) -> Option<Option<PathBuf>> {
     None
 }
 
-/// A tiny real mkv at `path` (needs [`ffmpeg_or_skip`] to have passed).
+/// A tiny real mkv at `path` (needs [`ffmpeg_or_skip`] to have passed). It has no cover, so a
+/// YouTube run over it would make the default thumbnail pass fetch one from the image CDN — a test
+/// not about that passes `--no-thumbnail`, keeping this suite offline.
 fn build_mkv(dir: Option<&Path>, path: &Path) {
     let ffmpeg = dir.map(|dir| dir.join("ffmpeg")).unwrap_or_else(|| PathBuf::from("ffmpeg"));
     let ok = Command::new(ffmpeg)
@@ -440,16 +442,61 @@ fn gated_failures_land_honest_cookie_aware_ledger_lines() {
 }
 
 #[test]
-fn patch_flags_on_a_non_youtube_site_name_the_supported_platforms_and_skip() {
+fn subtitles_on_a_non_youtube_site_names_the_supported_platforms_and_skips() {
     let rig = Rig::new("notice");
-    let out = rig.dl("ok", "https://media.example.com/v/2", &["--thumbnail", "--subtitles"]);
+    let out = rig.dl("ok", "https://media.example.com/v/2", &["--subtitles"]);
     assert!(out.status.success(), "{}", text(&out));
     let all = text(&out);
-    assert!(all.contains("supported platforms: youtube"), "names what IS supported: {all}");
+    assert!(
+        all.contains("--subtitles supported platforms: youtube"),
+        "names what IS supported: {all}"
+    );
     assert!(
         !all.contains("thumbnails: scanning") && !all.contains("subtitles: scanning"),
         "the passes themselves must not run off-platform: {all}"
     );
+}
+
+/// The thumbnail pass is a default, not a request — so a site it cannot serve is left out of it
+/// without a word, where an asked-for `--subtitles` is told why.
+#[test]
+fn a_plain_run_on_a_non_youtube_site_makes_no_thumbnail_pass_and_no_notice_about_it() {
+    let rig = Rig::new("no_notice");
+    let out = rig.dl("ok", "https://media.example.com/v/2", &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(!all.contains("thumbnails: scanning"), "no pass off-platform: {all}");
+    assert!(!all.contains("supported platforms"), "and no notice for what nobody asked: {all}");
+}
+
+/// Cover art is the default in each of YouTube's three flows: a run makes the thumbnail pass
+/// unless told `--no-thumbnail` — or downloading audio, which has no Matroska video to embed a
+/// cover in.
+#[test]
+fn every_youtube_flow_makes_the_thumbnail_pass_unless_told_not_to_or_downloading_audio() {
+    let flows = [
+        ("video", YT_VIDEO),
+        ("playlist", "https://www.youtube.com/playlist?list=PLstub"),
+        ("channel", "https://www.youtube.com/@stubchannel"),
+    ];
+    let cases: [(&[&str], bool); 3] =
+        [(&[], true), (&["--no-thumbnail"], false), (&["--audio"], false)];
+    for (flow, url) in flows {
+        for (case, (flags, makes_the_pass)) in cases.iter().enumerate() {
+            let rig = Rig::new(&format!("thumb_{flow}_{case}"));
+            // One entry for a collection's pass to cover; a lone video needs no scan.
+            fs::write(rig.stub.join("scan.txt"), "1\tvidthumb001\tClip\tStub\nStub [PLstub]\n")
+                .unwrap();
+            let out = rig.dl("ok", url, flags);
+            assert!(out.status.success(), "{flow} {flags:?}: {}", text(&out));
+            assert_eq!(
+                text(&out).contains("thumbnails: scanning"),
+                *makes_the_pass,
+                "{flow} {flags:?}: {}",
+                text(&out)
+            );
+        }
+    }
 }
 
 #[test]
@@ -677,7 +724,7 @@ fn a_subtitle_fetch_that_yields_no_sidecars_is_reported_as_rate_limited() {
         "stubvid0000\nen\n{\"en\": [{\"name\": \"English\"}]}\n{}\n",
     )
     .unwrap();
-    let out = rig.dl("ok", YT_VIDEO, &["--subtitles"]);
+    let out = rig.dl("ok", YT_VIDEO, &["--subtitles", "--no-thumbnail"]);
     assert!(out.status.success(), "{}", text(&out));
     let all = text(&out);
     assert!(all.contains("missing subtitle(s): en"), "{all}");
@@ -691,7 +738,7 @@ fn a_video_with_no_subtitles_anywhere_reads_as_nothing_to_embed_not_all_zero() {
     rig.extra_path = ffmpeg_dir.clone();
     build_mkv(ffmpeg_dir.as_deref(), &rig.into.join("v__stubvid0000.mkv"));
     // Default probe: NA everywhere → the expected set is empty.
-    let out = rig.dl("ok", YT_VIDEO, &["--subtitles"]);
+    let out = rig.dl("ok", YT_VIDEO, &["--subtitles", "--no-thumbnail"]);
     assert!(out.status.success(), "{}", text(&out));
     let all = text(&out);
     assert!(all.contains("no subtitles exist for this video — nothing to embed"), "{all}");

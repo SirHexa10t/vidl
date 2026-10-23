@@ -73,11 +73,12 @@ pub struct Args {
     /// request otherwise stalls ~5s on the fallback. Pass this on an IPv6-only network
     #[arg(long)]
     pub allow_ipv6: bool,
-    /// Embed a cover-art thumbnail into each video (off by default — it costs extra requests).
-    /// Handled as a late, idempotent pass: it skips videos that already have one and, ignoring
-    /// the download archive, will patch previously-downloaded videos on a re-run
+    /// Leave out the cover-art thumbnail each YouTube video otherwise gets — embedded by a late,
+    /// idempotent pass that skips videos already having one and, ignoring the download archive,
+    /// patches previously-downloaded videos on a re-run (one extra request per video it embeds
+    /// into). Audio downloads get none either way
     #[arg(long)]
-    pub thumbnail: bool,
+    pub no_thumbnail: bool,
     /// Force a subtitle scan of the target video(s) and embed any expected tracks that are
     /// missing. Subtitles already ride a normal download; this late, idempotent pass (ignoring
     /// the download archive) is for patching previously-downloaded videos on a re-run
@@ -143,7 +144,7 @@ impl Args {
             audio: self.audio,
             res: self.res,
             allow_ipv6: self.allow_ipv6,
-            thumbnail: self.thumbnail,
+            thumbnail: !self.no_thumbnail,
             subtitles: self.subtitles,
             multi: self.multi,
             name: self.name.as_deref(),
@@ -295,7 +296,9 @@ mod tests {
         assert_eq!(env.res, Some(720));
         assert!(env.subtitles);
         assert_eq!(env.extra, ["-q"], "everything after `--` is yt-dlp's, verbatim");
-        assert!(!env.thumbnail, "an unmentioned flag stays off");
+        assert!(env.thumbnail, "thumbnails come unless `--no-thumbnail` says otherwise");
+        assert!(!parse(&["u", "--no-thumbnail"]).env().thumbnail);
+        assert!(Cli::try_parse_from(["vidl", "u", "--thumbnail"]).is_err(), "the old opt-in is gone");
     }
 
     #[test]
