@@ -5,6 +5,8 @@
 //! [`subtitles`] is the planner for that last part: which caption tracks a given video *should*
 //! have, chosen from YouTube's ~157-language matrix, before anything is fetched or muxed.
 
+pub(crate) mod facts;
+pub(crate) mod repair;
 pub(crate) mod subtitles;
 
 use std::ffi::OsString;
@@ -28,18 +30,8 @@ pub(crate) fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) 
     if autos.is_empty() || env.audio {
         return;
     }
-    let Some(file) = find_by_id(root, id) else { return };
-    let ffprobe = crate::tools::ffprobe();
-    let Some(listing) = capture_stdout(
-        &ffprobe,
-        [
-            OsString::from("-v"), "error".into(),
-            "-select_streams".into(), "s".into(),
-            "-show_entries".into(), "stream_tags=title".into(),
-            "-of".into(), "csv=p=0".into(),
-            file.as_os_str().to_owned(),
-        ],
-    ) else {
+    let Some(file) = find_by_id(root, id, Prefer::Video) else { return };
+    let Some(listing) = subtitle_title_listing(&file) else {
         eprintln!(
             "vidl: could not read {}'s subtitle titles (ffprobe) — auto-generated stamps skipped",
             file.display()
@@ -69,6 +61,34 @@ pub(crate) fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) 
         );
         return;
     }
+    if apply_title_stamps(&file, &retitle) {
+        for (_, title) in &retitle {
+            println!("stamped subtitle track: {title}");
+        }
+    } else {
+        eprintln!("vidl: could not stamp auto-subtitle titles in {}", file.display());
+    }
+}
+
+/// `file`'s subtitle titles, one line per subtitle stream in stream order — an untitled one an
+/// empty line — as [`auto_title_stamps`] reads them; `None` if ffprobe couldn't run.
+fn subtitle_title_listing(file: &Path) -> Option<String> {
+    let ffprobe = crate::tools::ffprobe();
+    capture_stdout(
+        &ffprobe,
+        [
+            OsString::from("-v"), "error".into(),
+            "-select_streams".into(), "s".into(),
+            "-show_entries".into(), "stream_tags=title".into(),
+            "-of".into(), "csv=p=0".into(),
+            file.as_os_str().to_owned(),
+        ],
+    )
+}
+
+/// Retitle the mkv `file`'s subtitle tracks as `stamps` says (subtitle-stream order, new title), in
+/// one local stream-copy remux renamed over it. Returns success; on failure the file is as it was.
+fn apply_title_stamps(file: &Path, stamps: &[(usize, String)]) -> bool {
     let ffmpeg = crate::tools::ffmpeg();
     let stamped = file.with_extension("stamping.mkv");
     let mut argv: Vec<OsString> = ["-nostdin", "-v", "error", "-y", "-i"].map(OsString::from).to_vec();
@@ -77,25 +97,20 @@ pub(crate) fn mark_auto_titles(root: &Path, id: &str, picks: &[Pick], env: Env) 
     // ([`CoverCarry`]). This used to rest on call order alone — straight after a fresh download,
     // before any thumbnail pass — which a file already on disk but missing from the archive
     // breaks: yt-dlp calls it "already downloaded", and the finishing pass stamps it, cover and all.
-    let carry = embedded(&file).map(|embedded| CoverCarry::take(&file, &embedded)).unwrap_or_default();
+    let carry = embedded(file).map(|embedded| CoverCarry::take(file, &embedded)).unwrap_or_default();
     argv.extend(["-map", "0", "-c", "copy"].map(OsString::from));
     argv.extend(carry.args());
-    for (order, title) in &retitle {
+    for (order, title) in stamps {
         argv.push(format!("-metadata:s:s:{order}").into());
         argv.push(format!("title={title}").into());
     }
     argv.push(stamped.as_os_str().to_owned());
-    let renamed = crate::util::exec::run_ok(&ffmpeg, &argv)
-        && std::fs::rename(&stamped, &file).is_ok();
+    let renamed = crate::util::exec::run_ok(&ffmpeg, &argv) && std::fs::rename(&stamped, file).is_ok();
     carry.clean();
-    if renamed {
-        for (_, title) in &retitle {
-            println!("stamped subtitle track: {title}");
-        }
-    } else {
+    if !renamed {
         let _ = std::fs::remove_file(&stamped);
-        eprintln!("vidl: could not stamp auto-subtitle titles in {}", file.display());
     }
+    renamed
 }
 
 /// The (subtitle-stream order, stamped title) rewrites for `listing` — ffprobe's one-title-per-
@@ -135,7 +150,7 @@ pub(crate) fn embed_subtitle_tags(root: &Path, id: &str, picks: &[Pick]) {
     if picks.is_empty() {
         return;
     }
-    let Some(file) = find_by_id(root, id) else { return };
+    let Some(file) = find_by_id(root, id, Prefer::Audio) else { return };
     let pairs = subtitle_sidecars(&file, picks);
     if pairs.is_empty() {
         return;
@@ -540,9 +555,11 @@ fn embed_one_thumbnail(file: &Path, id: &str) -> bool {
 }
 
 /// The late cover-art pass, which a run makes unless `--no-thumbnail`: for each video `id` under
-/// `dir`, scan and report whether it already has an embedded thumbnail — so the user sees up front
-/// what's missing rather than waiting on unbounded work — then fetch + embed only the ones lacking
-/// one.
+/// `dir`, scan whether it already has an embedded thumbnail — naming each one that's missing up
+/// front, so the user sees what's coming rather than waiting on unbounded work — then fetch +
+/// embed only those. A video it leaves alone is counted, not named ([`Tally`]): every run makes
+/// this pass, and a re-run over a whole channel would otherwise print a line per video it did
+/// nothing to.
 /// Deliberately independent of the download archive, so a re-run *patches* previously-downloaded
 /// videos; the embedded-thumbnail check keeps it idempotent (a video that already has one is never
 /// re-fetched or re-embedded). A thumbnail an earlier remux demoted to a plain video track is no
@@ -553,46 +570,92 @@ pub(crate) fn embed_thumbnails(dir: &Path, ids: &[String]) {
         return;
     }
     println!("thumbnails: scanning {} video(s)…", ids.len());
+    let mut tally = Tally::default();
     let mut missing: Vec<(String, PathBuf)> = Vec::new();
     for id in ids {
-        match find_by_id(dir, id) {
-            None => println!("  [{id}]: {}", style::problematic("no file found — skipping")),
+        match find_by_id(dir, id, Prefer::Video) {
+            None => {
+                tally.skipped += 1;
+                println!("  [{id}]: {}", style::problematic("no file found — skipping"));
+            }
             // A cover embeds as an mkv attachment ([`attach_thumbnail`] muxes into the mkv
             // container) — renaming that over an audio/webm file would swap its container out
             // from under it, corrupting it. Skip anything that isn't an mkv, and say so.
             Some(file) if !is_mkv(&file) => {
+                tally.skipped += 1;
                 println!("  [{id}]: {}", style::problematic("not an mkv — cover art embeds into video (mkv) only; skipping"));
             }
             Some(file) => match embedded(&file) {
                 Some(embedded) if embedded.covers.iter().any(|cover| cover.demoted) => {
                     if repair_covers(&file, &embedded) {
+                        tally.restored += 1;
                         println!("  [{id}]: {}", style::approved("thumbnail restored (a remux had made a plain video track of it)"));
                     } else {
+                        tally.failed += 1;
                         eprintln!("  [{id}]: {}", style::problematic("could not restore its thumbnail"));
                     }
                 }
-                Some(embedded) if !embedded.covers.is_empty() => {
-                    println!("  [{id}]: {}", style::approved("already has a thumbnail"));
-                }
+                Some(embedded) if !embedded.covers.is_empty() => tally.present += 1,
                 Some(_) => {
                     println!("  [{id}]: {}", style::problematic("missing a thumbnail"));
                     missing.push((id.clone(), file));
                 }
-                None => println!("  [{id}]: {}", style::problematic("could not read (ffprobe) — skipping")),
+                None => {
+                    tally.skipped += 1;
+                    println!("  [{id}]: {}", style::problematic("could not read (ffprobe) — skipping"));
+                }
             },
         }
     }
-    if missing.is_empty() {
-        println!("thumbnails: all present — nothing to embed");
-        return;
+    if !missing.is_empty() {
+        println!("thumbnails: fetching + embedding {} …", missing.len());
     }
-    println!("thumbnails: fetching + embedding {} …", missing.len());
     for (id, file) in &missing {
         if embed_one_thumbnail(file, id) {
+            tally.embedded += 1;
             println!("  [{id}]: {}", style::approved("embedded"));
         } else {
+            tally.failed += 1;
             eprintln!("  [{id}]: {}", style::problematic("could not embed a thumbnail"));
         }
+    }
+    println!("thumbnails: {}", tally.summary());
+}
+
+/// What one thumbnail pass found and did, for its closing line — the only mention a video it left
+/// alone gets.
+#[derive(Default)]
+struct Tally {
+    /// Already had a cover.
+    present: usize,
+    /// Had a cover a remux demoted, now put back.
+    restored: usize,
+    /// Fetched and embedded.
+    embedded: usize,
+    /// Could not be restored or embedded.
+    failed: usize,
+    /// No file, not an mkv, or unreadable.
+    skipped: usize,
+}
+
+impl Tally {
+    /// `298 present, 1 restored, 1 embedded, 1 failed, 1 skipped` — every count that isn't zero.
+    fn summary(&self) -> String {
+        // Destructured, not read field by field, so a new count cannot be left out of the line.
+        let Tally { present, restored, embedded, failed, skipped } = *self;
+        let counts = [
+            (present, "present"),
+            (restored, "restored"),
+            (embedded, "embedded"),
+            (failed, "failed"),
+            (skipped, "skipped"),
+        ];
+        let said: Vec<String> = counts
+            .iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, what)| format!("{count} {what}"))
+            .collect();
+        said.join(", ")
     }
 }
 
@@ -703,7 +766,7 @@ fn mux_subtitles(file: &Path, arrived: &[(&Pick, PathBuf)], existing: usize) -> 
 /// patches an already-downloaded video). Video-only: an mkv holds subtitle streams; audio files
 /// carry their subtitles as metadata tags from the original download, so they're skipped here.
 pub(crate) fn embed_subtitles(into: &Path, id: &str, url: &str, expected: &[Pick], env: Env) {
-    let Some(file) = find_by_id(into, id) else {
+    let Some(file) = find_by_id(into, id, Prefer::Video) else {
         println!("  [{id}]: {}", style::problematic("no file found — skipping"));
         return;
     };
@@ -780,13 +843,10 @@ pub(crate) fn patch_collection_subtitles(url: &str, entries: &[&ScanEntry], home
     println!("subtitles: scanning {} video(s)…", entries.len());
     let indexes: Vec<String> = entries.iter().map(|entry| entry.index.clone()).collect();
     for plan in batch_probe(url, &indexes, env) {
-        let watch = format!("https://www.youtube.com/watch?v={}", plan.id);
-        embed_subtitles(home, &plan.id, &watch, &plan.picks, env);
+        embed_subtitles(home, &plan.id, &facts::watch_url(&plan.id), &plan.picks, env);
     }
 }
 
-/// The downloaded file whose name carries `__<id>.` — the id rides in every output template
-/// precisely so files stay findable. A shallow recursive walk under `root`.
 /// The video containers a download can land in.
 ///
 /// `.mkv` is the default merge target and `.webm` a documented override. `.mp4` earns its place
@@ -911,11 +971,46 @@ fn is_stale_part(path: &Path) -> bool {
     !name.contains("__") && is_media_name(stem)
 }
 
-pub(crate) fn find_by_id(root: &Path, id: &str) -> Option<PathBuf> {
+/// Which of a video's downloads a pass works on, when [`find_by_id`] finds more than one.
+#[derive(Clone, Copy)]
+pub(crate) enum Prefer {
+    /// The video — the mkv the passes mux into before any other container.
+    Video,
+    /// The audio extraction, which subtitle tags go into.
+    Audio,
+}
+
+impl Prefer {
+    /// How well `file` suits: 0 is the download wanted, and a higher rank is taken only when
+    /// nothing better is there — so a pass finding just the other kind still has it to report
+    /// on, as it did when every folder held one download per video.
+    fn rank(self, file: &Path) -> u8 {
+        match self {
+            Prefer::Video if is_mkv(file) => 0,
+            Prefer::Video if is_audio(file) => 2,
+            Prefer::Video => 1,
+            Prefer::Audio if is_audio(file) => 0,
+            Prefer::Audio => 1,
+        }
+    }
+}
+
+/// The downloaded file whose name carries `__<id>.` — the id rides in every output template
+/// precisely so files stay findable. A shallow recursive walk under `root`.
+///
+/// A folder can hold more than one download of a video — an audio extraction beside the video,
+/// or a copy in a collection folder further down — so each is ranked for the pass asking
+/// ([`Prefer`]), and the walk stops at the first one wanted most. Taking the first one met left
+/// it to the order the filesystem lists them in: the thumbnail pass could meet the audio, skip it
+/// as no mkv, and never reach the video beside it. A folder that cannot be read hides only what
+/// is in it.
+pub(crate) fn find_by_id(root: &Path, id: &str, prefer: Prefer) -> Option<PathBuf> {
     let marker = format!("__{id}.");
+    let mut best: Option<(u8, PathBuf)> = None;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
@@ -923,11 +1018,17 @@ pub(crate) fn find_by_id(root: &Path, id: &str) -> Option<PathBuf> {
                 let name = name.to_string_lossy();
                 name.contains(&marker) && is_media_name(&name)
             }) {
-                return Some(path);
+                let rank = prefer.rank(&path);
+                if rank == 0 {
+                    return Some(path);
+                }
+                if best.as_ref().is_none_or(|(held, _)| rank < *held) {
+                    best = Some((rank, path));
+                }
             }
         }
     }
-    None
+    best.map(|(_, path)| path)
 }
 
 
@@ -996,6 +1097,16 @@ mod tests {
         assert_eq!(embedded_in(&listing), Embedded { covers: vec![cover(2, false), cover(3, true)], attachments: 1 });
         assert_eq!(embedded_in(&[video, audio].concat()), Embedded::default(), "video+audio, no cover");
         assert_eq!(embedded_in(""), Embedded::default(), "no streams");
+    }
+
+    #[test]
+    fn the_thumbnail_pass_closes_on_every_count_that_is_not_zero() {
+        let all = Tally { present: 298, restored: 1, embedded: 2, failed: 3, skipped: 4 };
+        assert_eq!(all.summary(), "298 present, 1 restored, 2 embedded, 3 failed, 4 skipped");
+        // A re-run that changed nothing says only that, and a fresh download only what it did.
+        assert_eq!(Tally { present: 300, ..Tally::default() }.summary(), "300 present");
+        assert_eq!(Tally { embedded: 1, ..Tally::default() }.summary(), "1 embedded");
+        assert_eq!(Tally { failed: 1, skipped: 2, ..Tally::default() }.summary(), "1 failed, 2 skipped");
     }
 
     #[test]
@@ -1082,14 +1193,68 @@ mod tests {
         std::fs::write(dir.join("a/b/20200101__Title__abcdefghijk.mkv"), b"x").unwrap();
         std::fs::write(dir.join("notes__abcdefghijk.txt"), b"x").unwrap(); // not a media ext
         std::fs::write(dir.join("song__qrstuvwxyz1.opus"), b"x").unwrap();
-        let found = find_by_id(&dir, "abcdefghijk").expect("nested mkv found");
+        let found = find_by_id(&dir, "abcdefghijk", Prefer::Video).expect("nested mkv found");
         assert!(found.ends_with("a/b/20200101__Title__abcdefghijk.mkv"), "{found:?}");
-        assert!(find_by_id(&dir, "qrstuvwxyz1").is_some(), "audio extensions match too");
+        assert!(find_by_id(&dir, "qrstuvwxyz1", Prefer::Audio).is_some(), "audio extensions match too");
         // `.mp4` is what a generic single-format download lands as; while it was missing from the
         // list, every pass that locates a file by its id silently skipped those.
         std::fs::write(dir.join("clip__mp4vid00001.mp4"), b"x").unwrap();
-        assert!(find_by_id(&dir, "mp4vid00001").is_some(), "generic downloads land as .mp4");
-        assert!(find_by_id(&dir, "zzzzzzzzzzz").is_none(), "an unknown id finds nothing");
+        assert!(find_by_id(&dir, "mp4vid00001", Prefer::Video).is_some(), "generic downloads land as .mp4");
+        assert!(find_by_id(&dir, "zzzzzzzzzzz", Prefer::Video).is_none(), "an unknown id finds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two downloads of one video in reach — an audio extraction beside the video, another
+    /// container, a copy in a collection folder further down — and each pass gets the one it works
+    /// on, whichever the filesystem lists first. A pass finding only the other kind still gets it,
+    /// to say why it cannot use it.
+    #[test]
+    fn each_pass_finds_the_download_it_works_on_among_several() {
+        let dir = scratch_dir("findbykind");
+        // Written in both orders, so the answer cannot come from the order they are listed in.
+        for (id, first, second) in [("orderedvid1", "opus", "mkv"), ("orderedvid2", "mkv", "opus")] {
+            std::fs::write(dir.join(format!("a__{id}.{first}")), b"x").unwrap();
+            std::fs::write(dir.join(format!("a__{id}.{second}")), b"x").unwrap();
+            let video = find_by_id(&dir, id, Prefer::Video).unwrap();
+            assert!(video.ends_with(format!("a__{id}.mkv")), "{first} then {second}: {video:?}");
+            let audio = find_by_id(&dir, id, Prefer::Audio).unwrap();
+            assert!(audio.ends_with(format!("a__{id}.opus")), "{first} then {second}: {audio:?}");
+        }
+        // The mkv the passes mux into, before another video container — deeper down or not.
+        std::fs::create_dir_all(dir.join("Mix [PLx]")).unwrap();
+        std::fs::write(dir.join("b__webmormkv1.webm"), b"x").unwrap();
+        std::fs::write(dir.join("Mix [PLx]/b__webmormkv1.mkv"), b"x").unwrap();
+        let video = find_by_id(&dir, "webmormkv1", Prefer::Video).unwrap();
+        assert!(video.ends_with("Mix [PLx]/b__webmormkv1.mkv"), "{video:?}");
+        // No mkv: another video container still comes before the audio, in either order.
+        for (id, first, second) in [("webmoropus1", "webm", "opus"), ("webmoropus2", "opus", "webm")] {
+            std::fs::write(dir.join(format!("e__{id}.{first}")), b"x").unwrap();
+            std::fs::write(dir.join(format!("e__{id}.{second}")), b"x").unwrap();
+            let video = find_by_id(&dir, id, Prefer::Video).unwrap();
+            assert!(video.ends_with(format!("e__{id}.webm")), "{first} then {second}: {video:?}");
+        }
+        // Only the other kind there: still found, so the pass can say what it found.
+        std::fs::write(dir.join("c__onlyaudio01.opus"), b"x").unwrap();
+        std::fs::write(dir.join("d__onlyvideo01.mkv"), b"x").unwrap();
+        assert!(find_by_id(&dir, "onlyaudio01", Prefer::Video).unwrap().ends_with("c__onlyaudio01.opus"));
+        assert!(find_by_id(&dir, "onlyvideo01", Prefer::Audio).unwrap().ends_with("d__onlyvideo01.mkv"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder the walk cannot read hides what is in it, and nothing else. Reading one used to
+    /// end the whole lookup, with no file at all — and a walk ranking its matches goes on past
+    /// one it does not want, into more folders, as it must here: the audio found first is no mkv.
+    #[test]
+    fn an_unreadable_folder_hides_only_what_is_in_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("findlocked");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(dir.join("s__lockedwalk1.opus"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let found = find_by_id(&dir, "lockedwalk1", Prefer::Video);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(found.is_some_and(|file| file.ends_with("s__lockedwalk1.opus")), "the walk must go on past it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1189,6 +1354,8 @@ mod tests {
         // (plain "English") with a non-auto pick, then stamp via mark_auto_titles.
         let plain = Pick { key: "en".into(), name: "English".into(), auto: false };
         assert!(mux_subtitles(&file, &[(&plain, sidecar)], 0));
+        // The same video's audio extraction beside it: the titles to stamp are still the video's.
+        std::fs::write(dir.join("v__abcdefghijk.opus"), b"OPUSDATA").unwrap();
 
         mark_auto_titles(&dir, "abcdefghijk", std::slice::from_ref(&auto), Env::default());
         let (_, titles) = subtitle_streams(&file).expect("probe works");
@@ -1426,6 +1593,8 @@ mod tests {
             return;
         }
         let dir = scratch_dir("audiotags");
+        // The same video's video beside each: the tags still go into the audio.
+        std::fs::write(dir.join("song__abcdefghijk.mkv"), b"not audio").unwrap();
         for (ext, codec) in [("opus", "libopus"), ("m4a", "aac"), ("mp3", "libmp3lame")] {
             let file = dir.join(format!("song__abcdefghijk.{ext}"));
             let built = std::process::Command::new(ff_bin("ffmpeg")).stdin(std::process::Stdio::null())

@@ -29,7 +29,12 @@
 #
 # Probe invocations (--print) always succeed: --flat-playlist replays scan.txt, a
 # --playlist-items probe replays probe.txt, and a lone-video probe prints video_probe.txt when
-# present (else a bare id/NA/NA/NA). A SUCCESSFUL download mimics the real yt-dlp's side effects:
+# present (else a bare id/NA/NA/NA) — except a repair's question about what YouTube offers now
+# (told apart by the chapters field only it prints), which replays facts.txt and, when
+# facts_errors.txt holds refusals, prints them to stderr and exits 1, as yt-dlp does under
+# --ignore-errors once any video was refused. A subtitle fetch (--skip-download) writes the
+# sidecar of each requested language listed in subs_served.txt, named as yt-dlp names it, and none
+# for the rest, as a 429'd track leaves none; a subs_refused file fails the whole fetch. A SUCCESSFUL download mimics the real yt-dlp's side effects:
 # it appends archive_adds.txt (if present) to the run's --download-archive (the collection
 # post-mortem reads it), appends names_adds.txt (if present) to the run's --print-to-file target
 # (the shortened-name record reads that), and copies cookie_dump.txt (if present) to a
@@ -93,6 +98,40 @@ if [[ "$args" == *" --write-pages "* ]]; then
         printf '%s\n' "$(<"$dir/page.txt")" > "./page_https_-_${host}_x.dump"
     fi
     emit "$dir/page_id.txt"
+    exit 0
+fi
+if [[ "$args" == *"%(chapters)+j"* ]]; then
+    emit "$dir/facts.txt"
+    if [[ -s "$dir/facts_errors.txt" ]]; then
+        printf '%s\n' "$(<"$dir/facts_errors.txt")" >&2
+        exit 1
+    fi
+    exit 0
+fi
+if [[ "$args" == *" --skip-download "* ]]; then
+    if [[ -e "$dir/subs_refused" ]]; then
+        echo "ERROR: Unable to download video subtitles for 'en': HTTP Error 429: Too Many Requests" >&2
+        exit 1
+    fi
+    output=""
+    langs=""
+    prev=""
+    for arg in "$@"; do
+        if [[ "$prev" == "--output" ]]; then output="$arg"; fi
+        if [[ "$prev" == "--sub-langs" ]]; then langs="$arg"; fi
+        prev="$arg"
+    done
+    served=" "
+    if [[ -s "$dir/subs_served.txt" ]]; then
+        served=" $(<"$dir/subs_served.txt") "
+        served="${served//$'\n'/ }"
+    fi
+    IFS=',' read -r -a wanted <<< "$langs"
+    for lang in "${wanted[@]}"; do
+        if [[ "$served" == *" $lang "* ]]; then
+            printf 'WEBVTT\n\n00:00.000 --> 00:01.000\nserved %s\n' "$lang" > "${output%.%(ext)s}.$lang.vtt"
+        fi
+    done
     exit 0
 fi
 if [[ "$args" == *" --print "* ]]; then

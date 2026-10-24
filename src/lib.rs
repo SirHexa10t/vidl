@@ -11,7 +11,8 @@
 //! - `ytdlp/` — talking *to* yt-dlp: argv assembly and launch, failure diagnosis and the
 //!   failed-downloads ledger, playlist/channel-tab enumeration.
 //! - `media/` — working on what came *back*: thumbnail, subtitle-track and audio-tag patching,
-//!   and the per-video subtitle plan drawn from the caption matrix.
+//!   the per-video subtitle plan drawn from the caption matrix, and [`repair`], which adds to a
+//!   folder of downloads the data each video lacks against what YouTube offers now.
 //! - `page/` — what a *page* lists, when it lists more than one video: reached only through
 //!   `--multi`, so nothing in it runs on a page that already works.
 //! - `cookies` — what a caller's cookie arguments mean, resolved once per run into flags yt-dlp
@@ -52,12 +53,16 @@ mod page;
 mod util;
 mod ytdlp;
 
-pub use cli::{Args, run};
+pub use cli::{Action, Args, run};
+pub use media::repair::repair;
 
 /// What the user asked for, shared by every yt-dlp invocation of one run. The mirror of [`Args`]
 /// (which is where a CLI-shaped caller starts) minus the parsing — *what to do*, never *where the
 /// programs are*; that is [`tools`]'s job and is set once per process.
-#[derive(Clone, Copy, Default)]
+///
+/// Its [`Default`] is what a command line asks for given nothing but the URL, so a library caller
+/// writing `..Default::default()` starts where the CLI does.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Env<'a> {
     /// A Netscape cookies file, when the run resolved to one (explicit; wins over a browser spec).
     pub cookies: Option<&'a Path>,
@@ -73,9 +78,9 @@ pub struct Env<'a> {
     /// broken or slow IPv6 route stalls each request ~5s on the happy-eyeballs fallback (measured);
     /// `--allow-ipv6` opts back in for an IPv6-only network.
     pub allow_ipv6: bool,
-    /// Embed a cover-art thumbnail — what the command line does unless told `--no-thumbnail`. A
-    /// late, idempotent pass handles it, so the main download stays fast and a re-run patches
-    /// previously-downloaded videos; an audio download gets none ([`thumbnails`]).
+    /// Embed a cover-art thumbnail — on unless the command line says `--no-thumbnail`, and on in
+    /// [`Default`] too. A late, idempotent pass handles it, so the main download stays fast and a
+    /// re-run patches previously-downloaded videos; an audio download gets none ([`thumbnails`]).
     pub thumbnail: bool,
     /// Force the subtitle patch pass: scan a video (fresh or already on disk) for its expected
     /// subtitles and embed any that are missing. A fresh download already embeds subtitles
@@ -91,6 +96,25 @@ pub struct Env<'a> {
     pub name: Option<&'a str>,
     /// Raw passthrough args, appended after every default so they win any flag repeated.
     pub extra: &'a [String],
+}
+
+// Written out rather than derived, which would leave `thumbnail` off where the command line has
+// it on. A literal naming every field also keeps a new one from going unconsidered here.
+impl Default for Env<'_> {
+    fn default() -> Self {
+        Env {
+            cookies: None,
+            cookies_from_browser: None,
+            audio: false,
+            res: None,
+            allow_ipv6: false,
+            thumbnail: true,
+            subtitles: false,
+            multi: false,
+            name: None,
+            extra: &[],
+        }
+    }
 }
 
 /// Run yt-dlp with `args` and capture both streams — for a caller that needs to *ask yt-dlp
@@ -110,7 +134,7 @@ use crate::util::exec::run_reporting_code;
 use crate::util::style;
 use ytdlp::failures::{GeoRescue, diagnose_failure, scrub_ledger, write_ledger};
 use ytdlp::{ARCHIVE_NAME, CHANNEL_TABS, channel_tab_argv, generic_argv, names, playlist_argv, launch, video_argv, ytdlp_invocation};
-use media::{embed_subtitles, embed_thumbnails, find_by_id, finish_media, patch_collection_subtitles};
+use media::{Prefer, embed_subtitles, embed_thumbnails, find_by_id, finish_media, patch_collection_subtitles};
 use ytdlp::scan::{ScanEntry, TabScan, archived_ids, is_tombstone, scan_playlist, scan_tab, unplayable_report};
 use media::subtitles::{Pick, Planned, batch_probe, default_picks, group_by_langs, video_picks};
 
@@ -202,7 +226,10 @@ pub fn download_video(url: &str, into: &Path, env: Env) -> i32 {
     // handling rides the download, so there's nothing to probe for. A URL we can't pull an id from
     // falls back to the probe. The thumbnail pass below still runs, patching a re-run.
     let url_id = id_from_url(url);
-    let on_disk = url_id.as_deref().is_some_and(|id| find_by_id(into, id).is_some());
+    // A download of either kind counts: one archive serves `--audio` runs and video runs alike,
+    // so yt-dlp would skip the other kind anyway.
+    let prefer = if env.audio { Prefer::Audio } else { Prefer::Video };
+    let on_disk = url_id.as_deref().is_some_and(|id| find_by_id(into, id, prefer).is_some());
     let mut code = 0;
     // `picks` feed the opt-in `--subtitles` pass. A fresh download always probes (it needs the
     // list to embed inline); an already-downloaded video probes only when `--subtitles` forces a

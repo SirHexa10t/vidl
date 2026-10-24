@@ -158,17 +158,22 @@ fn parse_scan(out: &str) -> Option<PlaylistScan> {
     (!entries.is_empty()).then_some(PlaylistScan { title, dirname, entries })
 }
 
-/// The video ids a download-archive has recorded (its lines are `<extractor> <id>` — the
-/// extractor prefix is yt-dlp's own on-disk format, kept so it can read the file back).
+/// The video ids a download-archive has recorded.
 pub(crate) fn archived_ids(path: &Path) -> HashSet<String> {
-    std::fs::read_to_string(path)
-        .map(|content| {
-            content
-                .lines()
-                .filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned))
-                .collect()
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    archive_entries(&content).into_iter().map(|(_, id)| id).collect()
+}
+
+/// A download archive's entries, `(extractor, id)` — its lines are `<extractor> <id>`, yt-dlp's
+/// own on-disk format, kept so it can read the file back.
+pub(crate) fn archive_entries(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            Some((words.next()?.to_owned(), words.next()?.to_owned()))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The titles YouTube substitutes once an entry can't be played by anyone anymore.

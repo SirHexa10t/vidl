@@ -179,13 +179,14 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
     let subs = subtitle_count(&file);
     let out = dl(&dir, &[]);
     assert!(out.contains("missing a thumbnail") && out.contains("embedded"), "{out}");
+    assert!(out.contains("thumbnails: 1 embedded"), "and counted: {out}");
     assert!(has_thumbnail(&file), "thumbnail patched in:\n{out}");
     assert_eq!(subtitle_count(&file), subs, "the thumbnail pass must not touch subtitles");
 
     // video+thumb+subs × `dl` → — (idempotent: seen as present, not re-embedded).
     let before = mtime(&file);
     let out = dl(&dir, &[]);
-    assert!(out.contains("already has a thumbnail"), "{out}");
+    assert!(out.contains("thumbnails: 1 present"), "{out}");
     assert_eq!(mtime(&file), before, "no re-embed when the thumbnail is already there");
 
     // video+thumb+subs × `--subtitles` → — (the forced scan finds every expected track present,
@@ -197,7 +198,7 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
         assert!(out.contains("already downloaded — scanning subtitles"), "{out}");
         assert!(out.contains("expected subtitle(s) already embedded"), "{out}");
         assert!(!out.contains("missing subtitle"), "{out}");
-        assert!(out.contains("already has a thumbnail"), "{out}");
+        assert!(out.contains("thumbnails: 1 present"), "{out}");
         assert_eq!(mtime(&file), before, "no re-mux when the subtitles are already there");
     }
 
@@ -207,6 +208,7 @@ fn existing_video_states_get_patched_only_where_the_table_says_so() {
     assert!(!has_thumbnail(&file), "state manufactured: bare video");
     let out = dl(&dir, &[]);
     assert!(out.contains("missing a thumbnail") && out.contains("embedded"), "{out}");
+    assert!(out.contains("thumbnails: 1 embedded"), "and counted: {out}");
     assert!(has_thumbnail(&file), "thumbnail patched onto the bare video:\n{out}");
     assert_eq!(subtitle_count(&file), 0, "the thumbnail pass must not add subtitles");
 
@@ -255,5 +257,68 @@ fn a_fresh_download_lands_video_subs_and_thumbnail_in_one_run() {
         assert!(out.contains("expected subtitle(s) already embedded"), "subs fetched once, not twice:\n{out}");
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `vidl repair <dir>` through the real binary, returning the combined output — not asserting
+/// success, since a repair YouTube refuses captions to fails while the rest is still added.
+fn repair(dir: &Path, flags: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_vidl"))
+        .arg("repair")
+        .arg(dir)
+        .args(flags)
+        .output()
+        .expect("run vidl");
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+/// Remux `file` in place down to its picture and sound alone — no cover, subtitle track, tag or
+/// chapter left of what the download embedded.
+fn scrub(file: &Path) {
+    let tmp = file.with_extension("scrubbed.mkv");
+    let mut cmd = Command::new(tool("ffmpeg"));
+    cmd.stdin(std::process::Stdio::null());
+    cmd.args(["-nostdin", "-v", "error", "-y", "-i"]).arg(file);
+    cmd.args(["-map", "0:v:0", "-map", "0:a", "-map_metadata", "-1", "-map_chapters", "-1", "-c", "copy"]).arg(&tmp);
+    assert!(cmd.status().expect("run ffmpeg").success(), "scrub remux failed");
+    std::fs::rename(&tmp, file).unwrap();
+}
+
+/// The keys of `file`'s container tags, lowercased.
+fn tag_keys(file: &Path) -> Vec<String> {
+    ffprobe(file, &["-show_entries", "format_tags", "-of", "default=nw=1"])
+        .lines()
+        .filter_map(|line| line.strip_prefix("TAG:")?.split_once('=').map(|(key, _)| key.to_lowercase()))
+        .collect()
+}
+
+/// A download scrubbed down to picture and sound — as if its other data had never been fetched —
+/// gets what a repair finds missing, asking the real YouTube: its thumbnail, its subtitles (unless
+/// the caption endpoint refuses this run), and its metadata; and a second repair finds it whole.
+#[test]
+#[ignore = "network: downloads from YouTube; needs the bundled yt-dlp/ffmpeg/deno"]
+fn a_scrubbed_download_gets_what_a_repair_finds_missing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = scratch("repair");
+    let out = dl(&dir, &[]);
+    let file = video_file(&dir);
+    let subs_ok = !subs_refused(&out);
+    scrub(&file);
+    assert!(!has_thumbnail(&file) && subtitle_count(&file) == 0 && !tag_keys(&file).contains(&"purl".to_string()), "scrubbed");
+
+    let out = repair(&dir, &[]);
+    assert!(out.contains("missing:"), "{out}");
+    assert!(has_thumbnail(&file), "the thumbnail was added:\n{out}");
+    let tags = tag_keys(&file);
+    for key in ["title", "date", "purl", "artist"] {
+        assert!(tags.contains(&key.to_string()), "{key} was added: {tags:?}\n{out}");
+    }
+    if subs_ok && !subs_refused(&out) && !out.contains("rate-limited") {
+        assert!(subtitle_count(&file) > 0, "the subtitles were added:\n{out}");
+        let again = repair(&dir, &[]);
+        assert!(again.contains("repair: 1 already complete"), "and a second repair finds it whole:\n{again}");
+    } else {
+        eprintln!("SKIPPED subtitle-content assertions: YouTube 429'd the caption endpoint this run");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

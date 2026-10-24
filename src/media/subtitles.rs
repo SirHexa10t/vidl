@@ -109,7 +109,7 @@ const PROBE_FORMAT: &str =
 
 /// Probes larger than this pace themselves with `--sleep-requests` (small ones finish before
 /// any rate-limiter would care).
-const PROBE_PACING_THRESHOLD: usize = 20;
+pub(super) const PROBE_PACING_THRESHOLD: usize = 20;
 
 /// One pending entry with its computed subtitle plan.
 pub(crate) struct Planned {
@@ -173,64 +173,18 @@ pub(crate) fn group_by_langs(planned: &[Planned]) -> Vec<Vec<&Planned>> {
     groups.into_iter().map(|(_, members)| members).collect()
 }
 
-/// The top-level keys of a JSON object paired with the first `"name"` string inside each
-/// key's value — dependency-free, same walking technique as [`json_top_keys`]. Fits yt-dlp's
-/// `%(subtitles)j` shape: `{"en": [{"url": …, "name": "English"}, …], …}`; a key whose value
-/// carries no name gets `""`.
-fn json_lang_names(json: &str) -> Vec<(String, String)> {
-    let mut entries: Vec<(String, String)> = Vec::new();
-    let mut depth = 0u32;
-    let mut in_string: Option<String> = None;
-    let mut escaped = false;
-    let mut pending: Option<(u32, String)> = None; // a closed string, with its depth
-    let mut await_name_value = false; // the last string was a `"name"` key inside a value
-    for ch in json.chars() {
-        if let Some(buffer) = in_string.as_mut() {
-            if escaped {
-                buffer.push(ch);
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                let text = in_string.take().unwrap();
-                if await_name_value {
-                    await_name_value = false;
-                    if let Some((_, name)) = entries.last_mut() {
-                        if name.is_empty() {
-                            *name = text;
-                        }
-                    }
-                } else {
-                    pending = Some((depth, text));
-                }
-            } else {
-                buffer.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = Some(String::new()),
-            ':' => match pending.take() {
-                Some((1, key)) => entries.push((key, String::new())),
-                Some((_, key)) if key == "name" => await_name_value = true,
-                _ => {}
-            },
-            ' ' | '\t' | '\n' | '\r' => {}
-            '{' | '[' => {
-                depth += 1;
-                pending = None;
-            }
-            '}' | ']' => {
-                depth = depth.saturating_sub(1);
-                pending = None;
-            }
-            _ => {
-                pending = None;
-                await_name_value = false;
-            }
-        }
-    }
-    entries
+/// The keys of a yt-dlp caption map, each with the first display name among its formats — the
+/// `%(subtitles)j` shape: `{"en": [{"url": …, "name": "English"}, …], …}`. A key whose formats
+/// carry no name gets `""`; what is no JSON object (yt-dlp's `NA`) reads as no keys at all.
+pub(super) fn json_lang_names(json: &str) -> Vec<(String, String)> {
+    let Some(map) = crate::util::json::parse(json) else { return Vec::new() };
+    map.members()
+        .iter()
+        .map(|(key, formats)| {
+            let name = formats.items().iter().find_map(|format| format.get("name")?.as_str());
+            (key.clone(), name.unwrap_or_default().to_string())
+        })
+        .collect()
 }
 
 

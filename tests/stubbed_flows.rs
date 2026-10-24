@@ -1,7 +1,8 @@
 //! Offline end-to-end tests of failure handling and collection orchestration, driven by a
-//! scripted yt-dlp stand-in (tests/fixtures/yt_dlp_stub.sh) placed first on the child's PATH.
-//! Deterministic and network-free — these run in the default `cargo test`, and complement the
-//! live tests in media_flags.rs / live_extended.rs rather than replacing them.
+//! scripted yt-dlp stand-in (tests/fixtures/yt_dlp_stub.sh) placed first on the child's PATH,
+//! beside a curl one that fails every fetch (tests/fixtures/curl_stub.sh). Deterministic and
+//! network-free — these run in the default `cargo test`, and complement the live tests in
+//! media_flags.rs / live_extended.rs rather than replacing them.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -10,8 +11,8 @@ use std::process::{Command, Output, Stdio};
 
 const YT_VIDEO: &str = "https://www.youtube.com/watch?v=stubvid0000";
 
-/// One test's world: a scratch root holding a download dir, the stub's state dir, and a bin dir
-/// with the stub installed as `yt-dlp`. Removed on drop.
+/// One test's world: a scratch root holding a download dir, the stubs' state dir, and a bin dir
+/// with the stand-ins installed as `yt-dlp` and `curl`. Removed on drop.
 struct Rig {
     root: PathBuf,
     into: PathBuf,
@@ -28,15 +29,19 @@ impl Rig {
         for dir in [&into, &stub, &bin] {
             fs::create_dir_all(dir).unwrap();
         }
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/yt_dlp_stub.sh");
-        let ytdlp = bin.join("yt-dlp");
-        fs::copy(&script, &ytdlp).unwrap();
-        fs::set_permissions(&ytdlp, fs::Permissions::from_mode(0o755)).unwrap();
+        // curl too, because every YouTube run makes the thumbnail pass: given a video without a
+        // cover, it would otherwise fetch one from the real image CDN.
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for (name, script) in [("yt-dlp", "yt_dlp_stub.sh"), ("curl", "curl_stub.sh")] {
+            let installed = bin.join(name);
+            fs::copy(fixtures.join(script), &installed).unwrap();
+            fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         Rig { root, into, stub, extra_path: None }
     }
 
-    /// Run `vidl <url> --into <rig into> <flags…>` with the rig's PATH/stub environment.
-    fn dl(&self, mode: &str, url: &str, flags: &[&str]) -> Output {
+    /// `vidl` with the rig's PATH and stub environment, its arguments still to give.
+    fn vidl(&self, mode: &str) -> Command {
         let extra = self
             .extra_path
             .as_ref()
@@ -47,21 +52,29 @@ impl Rig {
             self.root.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new(env!("CARGO_BIN_EXE_vidl"))
-            .arg(url)
-            .arg("--into")
-            .arg(&self.into)
-            .args(flags)
-            .env("PATH", path)
-            .env("VIDL_STUB_DIR", &self.stub)
-            .env("VIDL_STUB_MODE", mode)
-            .output()
-            .expect("run vidl")
+        let mut vidl = Command::new(env!("CARGO_BIN_EXE_vidl"));
+        vidl.env("PATH", path).env("VIDL_STUB_DIR", &self.stub).env("VIDL_STUB_MODE", mode);
+        vidl
+    }
+
+    /// Run `vidl <url> --into <rig into> <flags…>` with the rig's PATH/stub environment.
+    fn dl(&self, mode: &str, url: &str, flags: &[&str]) -> Output {
+        self.vidl(mode).arg(url).arg("--into").arg(&self.into).args(flags).output().expect("run vidl")
+    }
+
+    /// Run `vidl repair <rig into> <flags…>`, in the environment [`Self::dl`] runs in.
+    fn repair(&self, flags: &[&str]) -> Output {
+        self.vidl("ok").arg("repair").arg(&self.into).args(flags).output().expect("run vidl")
     }
 
     /// Every yt-dlp invocation the run made, one argv per line.
     fn calls(&self) -> String {
         fs::read_to_string(self.stub.join("calls.log")).unwrap_or_default()
+    }
+
+    /// Every curl invocation the run made, one argv per line — each of them failed.
+    fn curl_calls(&self) -> String {
+        fs::read_to_string(self.stub.join("curl.log")).unwrap_or_default()
     }
 
     /// An empty Netscape cookie jar inside the rig, as a string for the arg list. Its contents
@@ -176,19 +189,254 @@ fn ffmpeg_or_skip(test: &str) -> Option<Option<PathBuf>> {
     None
 }
 
-/// A tiny real mkv at `path` (needs [`ffmpeg_or_skip`] to have passed). It has no cover, so a
-/// YouTube run over it would make the default thumbnail pass fetch one from the image CDN — a test
-/// not about that passes `--no-thumbnail`, keeping this suite offline.
-fn build_mkv(dir: Option<&Path>, path: &Path) {
-    let ffmpeg = dir.map(|dir| dir.join("ffmpeg")).unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    let ok = Command::new(ffmpeg)
-        .stdin(Stdio::null()) // see util::exec — concurrent ffmpegs race over the terminal
-        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=1"])
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+/// The ffmpeg the test builds media with — from `dir` when [`ffmpeg_or_skip`] named one, else
+/// PATH's — quiet, and kept off the terminal (see util::exec: concurrent ffmpegs race over it).
+fn ffmpeg(dir: Option<&Path>) -> Command {
+    let mut command =
+        Command::new(dir.map(|dir| dir.join("ffmpeg")).unwrap_or_else(|| PathBuf::from("ffmpeg")));
+    command.stdin(Stdio::null()).args(["-nostdin", "-v", "error", "-y"]);
+    command
+}
+
+/// What of a download a test video holds, as [`lay_video`] lays it on disk.
+#[derive(Clone, Copy)]
+struct Laid<'a> {
+    cover: Cover,
+    /// Its subtitle tracks: `(language, title)`.
+    subtitles: &'a [(&'a str, &'a str)],
+    /// Every tag a download embeds ([`DOWNLOAD_TAGS`]), or none.
+    tags: bool,
+    /// The two chapters of [`CHAPTERS`], or none.
+    chapters: bool,
+}
+
+/// A video holding its picture and sound, and nothing else of a download.
+const BARE: Laid<'static> = Laid { cover: Cover::None, subtitles: &[], tags: false, chapters: false };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    None,
+    Attached,
+    /// Attached, then put through the plain `-map 0 -c copy` remux that demotes a cover: the
+    /// Matroska muxer writes it back as one more video track.
+    Demoted,
+}
+
+/// The metadata keys a YouTube download embeds, as yt-dlp hands them to ffmpeg — the ones
+/// [`facts_line`] gives a value for.
+const DOWNLOAD_TAGS: [&str; 8] = ["title", "date", "description", "synopsis", "purl", "comment", "artist", "genre"];
+
+/// Two chapters in ffmpeg's ffmetadata form: what a laid video holds when it holds chapters, and
+/// what [`facts_line`] says YouTube has.
+const CHAPTERS: &str = ";FFMETADATA1\n\
+                        [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=One\n\
+                        [CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2000\ntitle=Two\n";
+
+/// A one-colour JPEG at `path` — distinct colours, distinct pictures.
+fn draw_picture(dir: Option<&Path>, path: &Path, colour: &str) {
+    let drawn = ffmpeg(dir)
+        .args(["-f", "lavfi", "-i", &format!("color=c={colour}:s=32x32"), "-frames:v", "1", "-update", "1"])
         .arg(path)
         .status()
         .is_ok_and(|status| status.success());
-    assert!(ok, "could not build a test mkv");
+    assert!(drawn, "could not draw a picture");
+}
+
+/// A downloaded video at `path`: an mkv of two seconds' picture and sound, holding what `laid`
+/// says (needs [`ffmpeg_or_skip`] to have passed).
+fn lay_video(dir: Option<&Path>, path: &Path, laid: Laid) {
+    let parts = path.with_extension("parts");
+    fs::create_dir_all(&parts).unwrap();
+    let mut command = ffmpeg(dir);
+    command.args(["-f", "lavfi", "-i", "color=c=blue:s=64x64:d=2", "-f", "lavfi", "-i", "sine=frequency=440:duration=2"]);
+    for (number, (language, _)) in laid.subtitles.iter().enumerate() {
+        let track = parts.join(format!("{number}.vtt"));
+        fs::write(&track, format!("WEBVTT\n\n00:00.000 --> 00:01.000\n{language} words\n")).unwrap();
+        command.arg("-i").arg(track);
+    }
+    if laid.chapters {
+        let chapters = parts.join("chapters.ffmeta");
+        fs::write(&chapters, CHAPTERS).unwrap();
+        command.args(["-f", "ffmetadata", "-i"]).arg(chapters);
+        command.arg("-map_chapters").arg((2 + laid.subtitles.len()).to_string());
+    }
+    command.args(["-map", "0", "-map", "1"]);
+    for number in 0..laid.subtitles.len() {
+        command.arg("-map").arg((2 + number).to_string());
+    }
+    command.args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-c:s", "webvtt"]);
+    for (number, (language, title)) in laid.subtitles.iter().enumerate() {
+        command.arg(format!("-metadata:s:s:{number}")).arg(format!("language={language}"));
+        command.arg(format!("-metadata:s:s:{number}")).arg(format!("title={title}"));
+    }
+    if laid.tags {
+        for key in DOWNLOAD_TAGS {
+            command.arg("-metadata").arg(format!("{key}={key} as downloaded"));
+        }
+    }
+    if laid.cover != Cover::None {
+        let cover = parts.join("cover.jpg");
+        draw_picture(dir, &cover, "red");
+        command.arg("-attach").arg(cover);
+        command.args(["-metadata:s:t", "mimetype=image/jpeg", "-metadata:s:t", "filename=cover.jpg"]);
+    }
+    let laid_out = command.arg(path).status().is_ok_and(|status| status.success());
+    assert!(laid_out, "could not lay out {}", path.display());
+    if laid.cover == Cover::Demoted {
+        let demoted = parts.join("demoted.mkv");
+        let remuxed = ffmpeg(dir)
+            .arg("-i")
+            .arg(path)
+            .args(["-map", "0", "-c", "copy"])
+            .arg(&demoted)
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(remuxed && fs::rename(&demoted, path).is_ok(), "could not demote the cover");
+    }
+    fs::remove_dir_all(&parts).unwrap();
+}
+
+/// A downloaded audio extraction at `path` — two seconds of Opus, holding every tag a download
+/// embeds when `tags` — with neither subtitle tags nor chapters, nor a cover, which an audio
+/// download never gets.
+fn lay_audio(dir: Option<&Path>, path: &Path, tags: bool) {
+    let mut command = ffmpeg(dir);
+    command.args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "libopus"]);
+    if tags {
+        for key in DOWNLOAD_TAGS {
+            command.arg("-metadata").arg(format!("{key}={key} as downloaded"));
+        }
+    }
+    let laid_out = command.arg(path).status().is_ok_and(|status| status.success());
+    assert!(laid_out, "could not lay out {}", path.display());
+}
+
+/// A tiny real mkv at `path` (needs [`ffmpeg_or_skip`] to have passed). It has no cover, so a
+/// YouTube run over it makes the default thumbnail pass try to fetch one (from the failing curl
+/// stand-in); a test about something else passes `--no-thumbnail` to keep to its subject.
+fn build_mkv(dir: Option<&Path>, path: &Path) {
+    lay_video(dir, path, BARE);
+}
+
+/// [`build_mkv`] with a cover attached the way the thumbnail pass attaches one — a file the pass
+/// has nothing to do to.
+fn build_covered_mkv(dir: Option<&Path>, path: &Path) {
+    lay_video(dir, path, Laid { cover: Cover::Attached, ..BARE });
+}
+
+/// [`build_covered_mkv`] put through the plain `-map 0 -c copy` remux that demotes a cover: the
+/// Matroska muxer writes it back as one more video track, which the thumbnail pass restores.
+fn build_demoted_mkv(dir: Option<&Path>, path: &Path) {
+    lay_video(dir, path, Laid { cover: Cover::Demoted, ..BARE });
+}
+
+/// What a file holds, read back with ffprobe for an assertion — never by the code under test.
+#[derive(Debug, Default, PartialEq)]
+struct Held {
+    /// Pictures held as covers (`attached_pic`).
+    covers: usize,
+    /// Pictures a remux demoted to plain video tracks.
+    demoted: usize,
+    /// Its subtitle tracks' titles, in order.
+    subtitles: Vec<String>,
+    /// Its tags' keys, lowercased: an mkv's container tags; an audio file's, its streams' too.
+    tags: Vec<String>,
+    chapters: usize,
+}
+
+fn ffprobe_output(path: &Path, args: &[&str]) -> String {
+    let out = Command::new("ffprobe").args(["-v", "error"]).args(args).arg(path).output().expect("run ffprobe");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn held(path: &Path) -> Held {
+    let mut held = Held::default();
+    let streams = ffprobe_output(path, &["-show_entries", "stream=codec_name:stream_disposition=attached_pic", "-of", "default=nw=1"]);
+    let mut codec = String::new();
+    for line in streams.lines() {
+        if let Some(name) = line.strip_prefix("codec_name=") {
+            codec = name.to_string();
+        } else if line == "DISPOSITION:attached_pic=1" {
+            held.covers += 1;
+        } else if line == "DISPOSITION:attached_pic=0" && matches!(codec.as_str(), "mjpeg" | "png") {
+            held.demoted += 1;
+        }
+    }
+    held.subtitles = ffprobe_output(path, &["-select_streams", "s", "-show_entries", "stream_tags=title", "-of", "csv=p=0"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let entries = if path.extension().is_some_and(|ext| ext == "mkv") { "format_tags" } else { "format_tags:stream_tags" };
+    let tags = ffprobe_output(path, &["-show_entries", entries, "-of", "default=nw=1"]);
+    held.tags = tags
+        .lines()
+        .filter_map(|line| line.strip_prefix("TAG:")?.split_once('=').map(|(key, _)| key.to_lowercase()))
+        .collect();
+    held.tags.sort();
+    held.tags.dedup();
+    held.chapters = ffprobe_output(path, &["-show_chapters", "-of", "csv=p=0"]).lines().filter(|line| !line.is_empty()).count();
+    held
+}
+
+/// The picture `path` holds as its cover, as bytes.
+fn cover_bytes(path: &Path) -> Option<Vec<u8>> {
+    let streams = ffprobe_output(path, &["-show_entries", "stream=index:stream_disposition=attached_pic", "-of", "csv=p=0"]);
+    let index = streams.lines().find_map(|line| {
+        let (index, attached) = line.split_once(',')?;
+        (attached == "1").then(|| index.to_string())
+    })?;
+    let out = path.with_extension("cover-check.jpg");
+    let taken = ffmpeg(None)
+        .arg("-i")
+        .arg(path)
+        .args(["-map", &format!("0:{index}"), "-c", "copy", "-f", "image2", "-update", "1"])
+        .arg(&out)
+        .status()
+        .is_ok_and(|status| status.success());
+    let bytes = if taken { fs::read(&out).ok() } else { None };
+    let _ = fs::remove_file(&out);
+    bytes
+}
+
+/// The line yt-dlp prints about a video when a repair asks what YouTube offers now (vidl's facts
+/// template): the uploader's subtitles and the automatic ones, each `(key, name)`; a value for
+/// every key of [`DOWNLOAD_TAGS`]; and the chapters of [`CHAPTERS`].
+fn facts_line(id: &str, language: &str, subtitles: &[(&str, &str)], automatic: &[(&str, &str)]) -> String {
+    let captions = |tracks: &[(&str, &str)]| {
+        let entries: Vec<String> =
+            tracks.iter().map(|(key, name)| format!(r#""{key}": [{{"ext": "vtt", "name": "{name}"}}]"#)).collect();
+        format!("{{{}}}", entries.join(", "))
+    };
+    [
+        id.to_string(),
+        language.to_string(),
+        captions(subtitles),
+        captions(automatic),
+        format!(r#""Title of {id}""#),
+        "20200101".to_string(),
+        r#""First line\nsecond line""#.to_string(),
+        format!("https://www.youtube.com/watch?v={id}"),
+        r#""The Uploader""#.to_string(),
+        r#"["Education"]"#.to_string(),
+        "NA".to_string(),
+        r#"[{"start_time": 0.0, "title": "One", "end_time": 1.0}, {"start_time": 1.0, "title": "Two", "end_time": 2.0}]"#.to_string(),
+    ]
+    .join("\t")
+}
+
+/// The lines a repair printed under one file's heading — the heading naming `file`.
+fn under(all: &str, file: &str) -> String {
+    let mut lines = all.lines().skip_while(|line| !(line.starts_with("  ") && !line.starts_with("    ") && line.contains(file)));
+    assert!(lines.next().is_some(), "no heading for {file} in:\n{all}");
+    lines.take_while(|line| line.starts_with("    ")).collect::<Vec<_>>().join("\n")
+}
+
+/// The files and folders inside `dir`, every name — sidecars and temporary files included.
+fn everything_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> =
+        fs::read_dir(dir).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names
 }
 
 #[test]
@@ -499,6 +747,84 @@ fn every_youtube_flow_makes_the_thumbnail_pass_unless_told_not_to_or_downloading
     }
 }
 
+/// A video without a cover has one asked of YouTube's image CDN by its id: full size first, then
+/// the `hqdefault` every video has. A fetch that fails leaves the file as it was, and nothing
+/// beside it. (The rig's curl fails every fetch, which is what lets both asks show.)
+#[test]
+fn a_video_without_a_cover_asks_the_cdn_for_full_size_then_hq_and_a_miss_changes_nothing() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("thumbnail fetch order") else { return };
+    let mut rig = Rig::new("thumb_fetch");
+    rig.extra_path = ffmpeg_dir.clone();
+    let video = rig.into.join("v__stubvid0000.mkv");
+    build_mkv(ffmpeg_dir.as_deref(), &video);
+    let before = fs::read(&video).unwrap();
+
+    let out = rig.dl("ok", YT_VIDEO, &[]);
+    assert!(out.status.success(), "a cover it cannot have fails nothing else: {}", text(&out));
+    let curl = rig.curl_calls();
+    let asked: Vec<&str> = curl.lines().filter_map(|line| line.split(' ').next_back()).collect();
+    assert_eq!(
+        asked,
+        [
+            "https://i.ytimg.com/vi/stubvid0000/maxresdefault.jpg",
+            "https://i.ytimg.com/vi/stubvid0000/hqdefault.jpg",
+        ],
+        "{curl}"
+    );
+    assert!(text(&out).contains("could not embed a thumbnail"), "{}", text(&out));
+    assert_eq!(fs::read(&video).unwrap(), before, "a missed fetch must leave the file untouched");
+    assert_eq!(rig.files(), ["v__stubvid0000.mkv"], "and no fetched-image leftover beside it");
+}
+
+/// What a default run over a library says: a line for each video the thumbnail pass acts on or
+/// cannot, none for one it leaves alone — every run makes this pass, so a re-run over a whole
+/// channel must not list the channel back — and a closing count of all of them.
+#[test]
+fn the_thumbnail_pass_names_only_the_videos_it_acts_on_or_skips_and_counts_the_rest() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("thumbnail pass report") else { return };
+    let mut rig = Rig::new("thumb_report");
+    rig.extra_path = ffmpeg_dir.clone();
+    fs::write(
+        rig.stub.join("scan.txt"),
+        "1\tvidcover001\tCovered\tStub List\n\
+         2\tviddemo0002\tDemoted\tStub List\n\
+         3\tvidbare0003\tBare\tStub List\n\
+         4\tvidgone0004\tGone\tStub List\n\
+         Stub List [PLstub]\n",
+    )
+    .unwrap();
+    let home = rig.into.join("Stub List [PLstub]");
+    fs::create_dir_all(&home).unwrap();
+    // All four archived, so the run downloads nothing and goes straight to its passes.
+    fs::write(
+        home.join(".dl_video_archive.txt"),
+        "youtube vidcover001\nyoutube viddemo0002\nyoutube vidbare0003\nyoutube vidgone0004\n",
+    )
+    .unwrap();
+    build_covered_mkv(ffmpeg_dir.as_deref(), &home.join("Covered__vidcover001.mkv"));
+    build_demoted_mkv(ffmpeg_dir.as_deref(), &home.join("Demoted__viddemo0002.mkv"));
+    build_mkv(ffmpeg_dir.as_deref(), &home.join("Bare__vidbare0003.mkv"));
+
+    let out = rig.dl("ok", "https://www.youtube.com/playlist?list=PLstub", &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    let lines_of = |id: &str| -> Vec<&str> {
+        all.lines().filter(|line| line.contains(&format!("[{id}]"))).collect()
+    };
+    assert!(lines_of("vidcover001").is_empty(), "a video left alone gets no line: {all}");
+    let demoted = lines_of("viddemo0002");
+    assert!(demoted.iter().any(|line| line.contains("thumbnail restored")), "{all}");
+    let bare = lines_of("vidbare0003");
+    assert!(bare.iter().any(|line| line.contains("missing a thumbnail")), "{all}");
+    assert!(bare.iter().any(|line| line.contains("could not embed a thumbnail")), "{all}");
+    let gone = lines_of("vidgone0004");
+    assert!(gone.iter().any(|line| line.contains("no file found — skipping")), "{all}");
+    assert!(
+        all.contains("thumbnails: 1 present, 1 restored, 1 failed, 1 skipped"),
+        "and the count of all four: {all}"
+    );
+}
+
 #[test]
 fn a_playlist_scan_reports_tombstones_skips_archived_and_downloads_pending_in_one_group() {
     let rig = Rig::new("playlist");
@@ -696,6 +1022,24 @@ fn the_subtitle_pass_reports_audio_files_as_tag_carriers_and_skips_them() {
         b"OPUSDATA",
         "the audio file stays untouched"
     );
+}
+
+/// A video beside its own audio extraction — the two downloads one id can have — is the one the
+/// passes patch: the thumbnail pass asks the CDN for its cover, and the subtitle pass reads its
+/// tracks, rather than either stopping at the audio as the first file the folder listed.
+#[test]
+fn a_video_beside_its_audio_extraction_is_the_one_the_passes_patch() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("video beside its audio") else { return };
+    let mut rig = Rig::new("video_and_audio");
+    rig.extra_path = ffmpeg_dir.clone();
+    fs::write(rig.into.join("v__stubvid0000.opus"), b"OPUSDATA").unwrap();
+    build_mkv(ffmpeg_dir.as_deref(), &rig.into.join("v__stubvid0000.mkv"));
+    let out = rig.dl("ok", YT_VIDEO, &["--subtitles"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let all = text(&out);
+    assert!(all.contains("missing a thumbnail") && !all.contains("not an mkv"), "{all}");
+    assert!(rig.curl_calls().contains("/vi/stubvid0000/"), "its cover is asked for: {}", rig.curl_calls());
+    assert!(all.contains("no subtitles exist for this video") && !all.contains("audio — subtitles kept as tags"), "{all}");
 }
 
 #[test]
@@ -1198,3 +1542,279 @@ fn a_missing_url_is_refused_with_a_message() {
     assert!(text(&out).contains("URL is required"), "{}", text(&out));
 }
 
+
+/// A library with one of each kind of lack — a video holding nothing but picture and sound, a cover
+/// a remux demoted, an auto-generated track under YouTube's own name — gets what a download of each
+/// would hold now, said file by file; the whole one is left untouched and unmentioned. A second run
+/// then finds every video whole and changes nothing.
+#[test]
+fn a_repair_adds_what_each_video_lacks_and_a_second_run_finds_nothing_to_do() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("repair") else { return };
+    let mut rig = Rig::new("repair");
+    rig.extra_path = ffmpeg_dir.clone();
+    let dir = ffmpeg_dir.as_deref();
+    let english = [("en", "English")];
+    let whole = Laid { cover: Cover::Attached, subtitles: &english, tags: true, chapters: true };
+    let files = [
+        ("20200101__Whole__vidwhole001.mkv", whole),
+        ("20200101__Bare__vidbare0002.mkv", BARE),
+        ("20200101__Demoted__viddemo0003.mkv", Laid { cover: Cover::Demoted, ..whole }),
+        ("20200101__Unmarked__vidmark0004.mkv", Laid { subtitles: &[("ko", "Korean")], ..whole }),
+    ];
+    for (name, laid) in files {
+        lay_video(dir, &rig.into.join(name), laid);
+    }
+    fs::write(
+        rig.into.join(".dl_video_archive.txt"),
+        "youtube vidwhole001\nyoutube vidbare0002\nyoutube viddemo0003\nyoutube vidmark0004\n\
+         youtube vidgone0005\ngeneric somewhere01\n",
+    )
+    .unwrap();
+    let facts = [
+        facts_line("vidwhole001", "en", &english, &[]),
+        facts_line("vidbare0002", "ko", &english, &[("ko-orig", "Korean (Original)")]),
+        facts_line("viddemo0003", "en", &english, &[]),
+        facts_line("vidmark0004", "ko", &[], &[("ko", "Korean")]),
+    ];
+    fs::write(rig.stub.join("facts.txt"), facts.join("\n")).unwrap();
+    fs::write(rig.stub.join("subs_served.txt"), "en\nko-orig\n").unwrap();
+    draw_picture(dir, &rig.stub.join("thumb.jpg"), "green");
+    let whole_before = fs::read(rig.into.join(files[0].0)).unwrap();
+
+    let out = rig.repair(&[]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(!all.contains("vidwhole001]"), "a whole video gets no line: {all}");
+    assert_eq!(fs::read(rig.into.join(files[0].0)).unwrap(), whole_before, "and is left as it was");
+
+    let bare = under(&all, "vidbare0002");
+    for said in [
+        "missing: thumbnail, subtitles (en, ko-orig), metadata (title, date, description, synopsis, purl, comment, artist, genre), chapters (2)",
+        "thumbnail embedded",
+        "subtitles embedded: en, ko-orig",
+        "added metadata (title, date, description, synopsis, purl, comment, artist, genre) and 2 chapter(s)",
+    ] {
+        assert!(bare.contains(said), "{said:?} in:\n{bare}");
+    }
+    let held_bare = held(&rig.into.join(files[1].0));
+    assert_eq!((held_bare.covers, held_bare.demoted, held_bare.chapters), (1, 0, 2), "{held_bare:?}");
+    assert_eq!(held_bare.subtitles, ["English", "Korean (auto-generated)"]);
+    assert!(DOWNLOAD_TAGS.iter().all(|key| held_bare.tags.iter().any(|held| held == key)), "{held_bare:?}");
+    assert_eq!(cover_bytes(&rig.into.join(files[1].0)), fs::read(rig.stub.join("thumb.jpg")).ok(), "the picture YouTube served");
+
+    let demoted = under(&all, "viddemo0003");
+    assert!(demoted.contains("missing: thumbnail (a remux made a plain video track of it)"), "{demoted}");
+    assert!(demoted.contains("thumbnail restored"), "{demoted}");
+    let held_demoted = held(&rig.into.join(files[2].0));
+    assert_eq!((held_demoted.covers, held_demoted.demoted), (1, 0), "{held_demoted:?}");
+    assert!(!rig.curl_calls().contains("viddemo0003"), "a cover restored is not fetched again: {}", rig.curl_calls());
+
+    let unmarked = under(&all, "vidmark0004");
+    assert!(unmarked.contains("missing: auto-generated mark on 1 subtitle track(s)"), "{unmarked}");
+    assert!(unmarked.contains("marked 1 subtitle track(s) auto-generated"), "{unmarked}");
+    assert_eq!(held(&rig.into.join(files[3].0)).subtitles, ["Korean (auto-generated)"], "marked, not fetched twice");
+
+    assert!(all.contains("[vidgone0005]") && all.contains("archived, but with no file"), "{all}");
+    assert!(all.contains("1 archived from other sites"), "{all}");
+    assert!(all.contains("repair: 1 already complete, 3 completed"), "{all}");
+    let calls = rig.calls();
+    let asked = calls.lines().filter(|line| line.contains("%(chapters)")).count();
+    assert_eq!(asked, 1, "YouTube is asked once, about every video: {calls}");
+    assert_eq!(everything_in(&rig.into), {
+        let mut names: Vec<String> = files.iter().map(|(name, _)| name.to_string()).collect();
+        names.push(".dl_video_archive.txt".into());
+        names.sort();
+        names
+    }, "nothing left beside them");
+
+    let after: Vec<Vec<u8>> = files.iter().map(|(name, _)| fs::read(rig.into.join(name)).unwrap()).collect();
+    let again = rig.repair(&[]);
+    let all = text(&again);
+    assert!(again.status.success(), "{all}");
+    assert!(all.contains("repair: 4 already complete") && !all.contains("missing:"), "{all}");
+    let unchanged: Vec<Vec<u8>> = files.iter().map(|(name, _)| fs::read(rig.into.join(name)).unwrap()).collect();
+    assert!(after == unchanged, "a second run must change nothing");
+}
+
+/// What a repair cannot get is said, with the reason it was given, and fails the run — while
+/// everything else is still added: here, no picture from the image server and no subtitles served,
+/// yet the metadata and chapters go in; and a video YouTube will not talk about is left exactly as
+/// it was. A subtitle fetch refused outright says so as well.
+#[test]
+fn what_a_repair_cannot_get_is_said_the_rest_is_still_added_and_the_run_fails() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("repair failures") else { return };
+    let mut rig = Rig::new("repair_fail");
+    rig.extra_path = ffmpeg_dir.clone();
+    let dir = ffmpeg_dir.as_deref();
+    let lacking = "x__vidfail0001.mkv";
+    let walled = "x__vidwall0002.mkv";
+    lay_video(dir, &rig.into.join(lacking), BARE);
+    lay_video(dir, &rig.into.join(walled), Laid { cover: Cover::Attached, ..BARE });
+    fs::write(rig.stub.join("facts.txt"), facts_line("vidfail0001", "en", &[("en", "English")], &[])).unwrap();
+    fs::write(rig.stub.join("facts_errors.txt"), "ERROR: [youtube] vidwall0002: Sign in to confirm you're not a bot").unwrap();
+    let walled_before = fs::read(rig.into.join(walled)).unwrap();
+
+    let out = rig.repair(&[]);
+    let all = text(&out);
+    assert!(!out.status.success(), "a repair left wanting fails: {all}");
+    let failing = under(&all, "vidfail0001");
+    for said in [
+        "thumbnail: could not fetch it from YouTube's image server",
+        "subtitles: none of en arrived (rate-limited?)",
+        "added metadata (title, date, description, synopsis, purl, comment, artist, genre) and 2 chapter(s)",
+    ] {
+        assert!(failing.contains(said), "{said:?} in:\n{failing}");
+    }
+    let held_failing = held(&rig.into.join(lacking));
+    assert_eq!((held_failing.covers, held_failing.chapters), (0, 2), "{held_failing:?}");
+    assert!(held_failing.subtitles.is_empty());
+    assert!(DOWNLOAD_TAGS.iter().all(|key| held_failing.tags.iter().any(|held| held == key)), "{held_failing:?}");
+
+    let walled_said = under(&all, "vidwall0002");
+    assert!(
+        walled_said.contains("YouTube did not answer (Sign in to confirm you're not a bot) — its subtitles, metadata and chapters went unchecked"),
+        "{walled_said}"
+    );
+    assert_eq!(fs::read(rig.into.join(walled)).unwrap(), walled_before, "a video not checked is not touched");
+    assert!(all.contains("repair: 1 left incomplete, 1 not checked"), "{all}");
+    assert_eq!(everything_in(&rig.into), [lacking, walled], "no picture, sidecar or half-written file left");
+
+    // The fetch itself refused: said apart from tracks that merely did not arrive.
+    fs::write(rig.stub.join("subs_refused"), "").unwrap();
+    let refused = text(&rig.repair(&[]));
+    assert!(under(&refused, "vidfail0001").contains("subtitles: could not fetch en (yt-dlp failed)"), "{refused}");
+}
+
+/// `--check` says what each video lacks and changes nothing — no picture fetched, no subtitles
+/// asked for, no file rewritten — failing while anything is lacking, and passing once nothing is.
+#[test]
+fn checking_says_what_each_video_lacks_and_changes_nothing() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("repair --check") else { return };
+    let mut rig = Rig::new("repair_check");
+    rig.extra_path = ffmpeg_dir.clone();
+    let dir = ffmpeg_dir.as_deref();
+    let english = [("en", "English")];
+    let whole = "x__vidwhole001.mkv";
+    let bare = "x__vidbare0002.mkv";
+    lay_video(dir, &rig.into.join(whole), Laid { cover: Cover::Attached, subtitles: &english, tags: true, chapters: true });
+    lay_video(dir, &rig.into.join(bare), BARE);
+    let facts = [facts_line("vidwhole001", "en", &english, &[]), facts_line("vidbare0002", "en", &english, &[])];
+    fs::write(rig.stub.join("facts.txt"), facts.join("\n")).unwrap();
+    fs::write(rig.stub.join("subs_served.txt"), "en\n").unwrap();
+    draw_picture(dir, &rig.stub.join("thumb.jpg"), "green");
+    let before = (fs::read(rig.into.join(whole)).unwrap(), fs::read(rig.into.join(bare)).unwrap());
+
+    let out = rig.repair(&["--check"]);
+    let all = text(&out);
+    assert!(!out.status.success(), "a video lacking something fails the check: {all}");
+    assert!(
+        under(&all, "vidbare0002").contains(
+            "missing: thumbnail, subtitles (en), metadata (title, date, description, synopsis, purl, comment, artist, genre), chapters (2)"
+        ),
+        "{all}"
+    );
+    assert!(!all.contains("embedded") && !all.contains("added") && !all.contains("restored"), "nothing is added: {all}");
+    assert!(all.contains("repair --check: 1 already complete, 1 lacking something — nothing was changed"), "{all}");
+    assert_eq!((fs::read(rig.into.join(whole)).unwrap(), fs::read(rig.into.join(bare)).unwrap()), before);
+    assert!(rig.curl_calls().is_empty(), "no picture fetched: {}", rig.curl_calls());
+    assert!(!rig.calls().contains("--skip-download"), "no subtitles asked for: {}", rig.calls());
+
+    fs::remove_file(rig.into.join(bare)).unwrap();
+    let clean = rig.repair(&["--check"]);
+    assert!(clean.status.success(), "{}", text(&clean));
+    assert!(text(&clean).contains("repair --check: 1 already complete — nothing was changed"), "{}", text(&clean));
+}
+
+/// An audio extraction gets the subtitles it lacks as the tags they ride in there, its metadata —
+/// what its container keeps of it: Opus has no room for the description beside the comment — and
+/// its chapters; and is then found whole.
+#[test]
+fn an_audio_extraction_gets_the_subtitle_tags_metadata_and_chapters_it_lacks() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("repair audio") else { return };
+    let mut rig = Rig::new("repair_audio");
+    rig.extra_path = ffmpeg_dir.clone();
+    let song = rig.into.join("Song__vidaudi0001.opus");
+    lay_audio(ffmpeg_dir.as_deref(), &song, false);
+    fs::write(rig.stub.join("facts.txt"), facts_line("vidaudi0001", "en", &[("en", "English")], &[])).unwrap();
+    fs::write(rig.stub.join("subs_served.txt"), "en\n").unwrap();
+
+    let out = rig.repair(&[]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    let said = under(&all, "vidaudi0001");
+    for line in [
+        "missing: subtitles (en), metadata (title, date, synopsis, purl, comment, artist, genre), chapters (2)",
+        "subtitles embedded: en",
+        "added metadata (title, date, synopsis, purl, comment, artist, genre) and 2 chapter(s)",
+    ] {
+        assert!(said.contains(line), "{line:?} in:\n{said}");
+    }
+    assert!(!said.contains("thumbnail"), "an audio file gets no cover: {said}");
+    let held_song = held(&song);
+    assert_eq!((held_song.covers, held_song.chapters), (0, 2), "{held_song:?}");
+    for key in ["subtitles_en", "title", "date", "synopsis", "purl", "comment", "artist", "genre"] {
+        assert!(held_song.tags.iter().any(|held| held == key), "{key} in {held_song:?}");
+    }
+    let again = rig.repair(&[]);
+    assert!(text(&again).contains("repair: 1 already complete") && !text(&again).contains("missing:"), "{}", text(&again));
+}
+
+/// Every YouTube download under the folder is found by its id, a collection's folder included, and
+/// each copy of a video — here a video and its audio — gets what fits it, the video asked about
+/// once. A video in a container nothing is added to is named and passed over without failing the
+/// run, and a file named for no YouTube video is no concern of the repair.
+#[test]
+fn every_youtube_download_below_is_found_by_its_id_and_each_copy_completed() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("repair discovery") else { return };
+    let mut rig = Rig::new("repair_found");
+    rig.extra_path = ffmpeg_dir.clone();
+    let dir = ffmpeg_dir.as_deref();
+    let english = [("en", "English")];
+    let playlist = rig.into.join("Mix [PLmix]");
+    fs::create_dir_all(&playlist).unwrap();
+    fs::write(playlist.join(".dl_video_archive.txt"), "youtube vidnest0001\n").unwrap();
+    let nested = playlist.join("001__20200101__Nested__vidnest0001.mkv");
+    lay_video(dir, &nested, Laid { cover: Cover::None, subtitles: &english, tags: true, chapters: true });
+    lay_audio(dir, &rig.into.join("Nested__vidnest0001.opus"), true);
+    fs::write(rig.into.join("x__vidwebm0002.webm"), b"a webm").unwrap();
+    fs::write(rig.into.join("Some clip [abc123].mp4"), b"another site's").unwrap();
+    fs::write(rig.stub.join("facts.txt"), facts_line("vidnest0001", "en", &english, &[])).unwrap();
+    fs::write(rig.stub.join("subs_served.txt"), "en\n").unwrap();
+    draw_picture(dir, &rig.stub.join("thumb.jpg"), "green");
+
+    let out = rig.repair(&[]);
+    let all = text(&out);
+    assert!(out.status.success(), "a container passed over fails nothing: {all}");
+    let video = under(&all, "001__20200101__Nested__vidnest0001.mkv");
+    assert!(video.contains("missing: thumbnail") && video.contains("thumbnail embedded"), "{video}");
+    let audio = under(&all, "Nested__vidnest0001.opus [vidnest0001]");
+    assert!(audio.contains("missing: subtitles (en), chapters (2)") && audio.contains("subtitles embedded: en"), "{audio}");
+    assert!(under(&all, "vidwebm0002").contains("not an mkv"), "{all}");
+    assert!(!all.contains("Some clip"), "{all}");
+    assert!(all.contains("repair: 2 completed, 1 passed over (no mkv)"), "{all}");
+    let asked = rig.calls();
+    let asked = asked.lines().find(|line| line.contains("%(chapters)")).expect("YouTube was asked");
+    assert_eq!(asked.matches("vidnest0001").count(), 1, "once for both copies: {asked}");
+    assert!(!asked.contains("vidwebm0002"), "nothing asked about what nothing can be added to: {asked}");
+}
+
+/// A large library is asked about in parts, each counted off as YouTube answers it — a run's
+/// answers come all at once, and a paced one takes a second a video, so one silence of half an hour
+/// would read as a hang. (Files that are no media at all: what is counted here is the asking.)
+#[test]
+fn a_large_library_is_asked_about_in_parts_each_counted_off() {
+    let rig = Rig::new("repair_parts");
+    let ids: Vec<String> = (0..51).map(|n| format!("vidpart{n:04}")).collect();
+    for id in &ids {
+        fs::write(rig.into.join(format!("x__{id}.mkv")), b"not media").unwrap();
+    }
+    let out = rig.repair(&["--check"]);
+    let all = text(&out);
+    assert!(all.contains("repair: asking YouTube about 51 video(s)…"), "{all}");
+    assert!(all.contains("  asked about 50 of 51\n") && all.contains("  asked about 51 of 51\n"), "{all}");
+    let calls = rig.calls();
+    let parts: Vec<&str> = calls.lines().filter(|line| line.contains("%(chapters)")).collect();
+    assert_eq!(parts.len(), 2, "{calls}");
+    assert!(parts.iter().all(|part| part.contains("--sleep-requests 1")), "a library this size is paced: {calls}");
+    assert_eq!(parts[1].matches("watch?v=").count(), 1, "the second part asks about the one left: {}", parts[1]);
+}

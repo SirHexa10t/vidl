@@ -22,7 +22,7 @@ vidl 'https://vimeo.com/12345' --audio
 | `ffmpeg` + `ffprobe` | **required in practice** | Merging video+audio, muxing subtitle tracks, attaching cover art. Without them you get single-stream downloads and nothing else. |
 | `deno` | recommended | YouTube serves obfuscated player JavaScript that computes a media URL's signature. yt-dlp needs a JS runtime to execute it; without one, YouTube downloads lose formats or throttle. Any runtime yt-dlp recognises will do (`node`, `bun`, `quickjs`). |
 | `pycryptodomex` | recommended | A Python package in yt-dlp's own environment (`pip install pycryptodomex`), not a system binary. Lets yt-dlp decrypt AES-128 HLS streams *itself*; without it every such download is handed to ffmpeg, which ignores `--concurrent-fragments`, reports no incremental progress, and is markedly slower. Many broadcasters serve nothing else. |
-| `curl` | optional | Only for fetching thumbnails from the image CDN. |
+| `curl` | recommended | Fetches each YouTube video's thumbnail from the image CDN, which every run embeds unless `--no-thumbnail`. Without it, each video's thumbnail fails, and is reported so. |
 
 Rust dependencies are just two: `clap` (the CLI) and `lofty` (in-place audio tag writes). Nothing
 else is linked in, and there is no build script.
@@ -59,6 +59,19 @@ place rather than re-downloading it: the first run over videos downloaded withou
 embeds one into each. Every pass that rewrites a file carries its cover through as cover art; a
 cover an earlier remux turned into a plain video track — which players list as one more video and
 thumbnailers ignore — is restored by the thumbnail pass, without fetching another.
+
+**Completing what is already here (`vidl repair`).** `vidl repair [DIR]` adds to every YouTube
+video under DIR (the folder you are in, by default), collection folders included, the data a
+download of it would hold now and it lacks — data taken never to have been fetched as it should
+have been. That covers its thumbnail, its subtitle tracks (as tags, in an audio extraction) and
+their auto-generated marks, its metadata tags and its chapters. Videos are found by the id in their
+file names, never by title, since a title can change on YouTube. A file only gains: a tag it has
+keeps its value, and nothing is downloaded again. YouTube is asked about every video once, fifty
+at a time, each part counted off as it is answered. Whatever can't be added is named with its
+reason (a refused probe, a rate-limited caption, the image server) and makes the run exit 1. The
+archives are read too, so an archived video with no file left is reported. `vidl repair --check`
+only says what each video lacks. Only what the container can hold is expected: Ogg has no room for
+a description beside its comment, for one, and `.wav` keeps no chapters.
 
 **Names that fit.** Many sites put a whole post caption in the video's title, which is how a
 "title" of several hundred characters reaches a filesystem that refuses any path component over
@@ -142,6 +155,10 @@ match vidl::classify(url, false) {
     _                            => vidl::download_video(url, dir, env),
 };
 ```
+
+`Env::default()` is what a command line given only the URL asks for, thumbnails included.
+`vidl::repair(dir, env, check)` is `vidl repair` from code: it returns the exit code the
+command line would give.
 
 An embedder with its own command line flattens `vidl::Args` into its parser rather than restating
 the flags, and calls `vidl::run`. To override one option — cookies acquired some other way is the
