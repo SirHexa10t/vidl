@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # TEST.sh — run ALL of vidl's tests, including the live ones `cargo test` skips.
 #
-# Three categories, cheapest first:
+# Four categories, cheapest first:
 #   1. offline        unit + integration (a scripted yt-dlp stand-in on PATH) — network-free and
 #                     fast. A few of these ask a REAL yt-dlp what it does with an output template,
 #                     still without a network; they skip-with-notice when none is installed.
 #   2. live-quick     real YouTube downloads of a tiny public video, no cookies
-#   3. live-extended  real YouTube plus, for one test, a signed-in session you supply — either a
+#   3. live-extended  real YouTube plus, for two tests, a signed-in session you supply — either a
 #                     browser store (tests/cookies/browser.spec + store/) or a Netscape jar
-#                     (tests/cookies/youtube.txt), or VIDL_TEST_COOKIES pointing at either. That
-#                     test skips-with-notice without one; see tests/cookies/README.md.
-#                     Serialized and paced: it uses a real session sparingly.
+#                     (tests/cookies/youtube.txt), or VIDL_TEST_COOKIES pointing at either; the
+#                     store read-back takes the browser store alone. Each skips-with-notice without
+#                     one; see tests/cookies/README.md. Serialized and paced: it uses a real session
+#                     sparingly.
+#   4. live-ffmpeg    one real download from a broadcaster's CDN whose best-listed formats are not
+#                     served, rescued by falling back to one that is. Needs ffmpeg and yt-dlp, and
+#                     skips-with-notice without either — or once the site serves its best format.
 #
 # Live categories can fail for environmental reasons (offline, rate-limited, region blocks);
 # every category runs regardless, and the summary at the end shows what passed where.
@@ -24,9 +28,11 @@ for tool in yt-dlp ffmpeg ffprobe; do
 done
 
 declare -A RESULT
+ORDER=()   # every category, in the order it ran — the summary reads this, never a list of its own
 
 run_category() {
     local name="$1"; shift
+    ORDER+=("$name")
     echo
     echo "=== ${name} ==="
     if "$@"; then
@@ -50,13 +56,14 @@ run_category "live-ffmpeg"   cargo test --test ffmpeg_downloads -- --ignored --t
 echo
 echo "=== summary ==="
 failed=0
-for name in offline live-quick live-extended; do
+for name in "${ORDER[@]}"; do
     printf '  %-14s %s\n' "$name" "${RESULT[$name]}"
     [ "${RESULT[$name]}" = "FAIL" ] && failed=1
 done
-if [ -z "${VIDL_TEST_COOKIES:-}" ] && ! [ -s tests/cookies/browser.spec ] && ! [ -s tests/cookies/youtube.txt ]; then
+if [ -z "${VIDL_TEST_COOKIES:-}" ] && ! [ -s tests/cookies/browser.spec ] && ! [ -s tests/cookies/youtube/browser.spec ] \
+    && ! [ -s tests/cookies/youtube.txt ]; then
     echo
-    echo "note: no cookies supplied, so the age-restricted test self-skipped (SKIPPED line above)"
+    echo "note: no cookies supplied, so the two cookie tests self-skipped (SKIPPED lines above)"
     echo "      — see tests/cookies/README.md for full coverage."
 fi
 exit "$failed"

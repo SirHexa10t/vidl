@@ -64,7 +64,12 @@ impl Rig {
 
     /// Run `vidl repair <rig into> <flags…>`, in the environment [`Self::dl`] runs in.
     fn repair(&self, flags: &[&str]) -> Output {
-        self.vidl("ok").arg("repair").arg(&self.into).args(flags).output().expect("run vidl")
+        self.repair_at(&self.into, flags)
+    }
+
+    /// [`Self::repair`] of `path` — a folder, or one file.
+    fn repair_at(&self, path: &Path, flags: &[&str]) -> Output {
+        self.vidl("ok").arg("repair").arg(path).args(flags).output().expect("run vidl")
     }
 
     /// Every yt-dlp invocation the run made, one argv per line.
@@ -208,10 +213,12 @@ struct Laid<'a> {
     tags: bool,
     /// The two chapters of [`CHAPTERS`], or none.
     chapters: bool,
+    /// The page it was downloaded from, in the `purl` and `comment` tags where a download puts it.
+    source: Option<&'a str>,
 }
 
 /// A video holding its picture and sound, and nothing else of a download.
-const BARE: Laid<'static> = Laid { cover: Cover::None, subtitles: &[], tags: false, chapters: false };
+const BARE: Laid<'static> = Laid { cover: Cover::None, subtitles: &[], tags: false, chapters: false, source: None };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cover {
@@ -269,10 +276,13 @@ fn lay_video(dir: Option<&Path>, path: &Path, laid: Laid) {
         command.arg(format!("-metadata:s:s:{number}")).arg(format!("language={language}"));
         command.arg(format!("-metadata:s:s:{number}")).arg(format!("title={title}"));
     }
-    if laid.tags {
-        for key in DOWNLOAD_TAGS {
-            command.arg("-metadata").arg(format!("{key}={key} as downloaded"));
-        }
+    for key in DOWNLOAD_TAGS {
+        let value = match laid.source.filter(|_| matches!(key, "purl" | "comment")) {
+            Some(page) => page.to_string(),
+            None if laid.tags => format!("{key} as downloaded"),
+            None => continue,
+        };
+        command.arg("-metadata").arg(format!("{key}={value}"));
     }
     if laid.cover != Cover::None {
         let cover = parts.join("cover.jpg");
@@ -1007,6 +1017,29 @@ fn a_probe_over_the_pacing_threshold_sleeps_between_requests() {
     assert!(probe.contains("--sleep-requests 1"), "big probes must pace themselves:\n{probe}");
 }
 
+/// One entry a playlist probe is refused for — a removed video, which makes yt-dlp exit 1 under
+/// `--ignore-errors` after answering for the rest — costs that entry its subtitle plan, never every
+/// other entry theirs: the probe is read whatever the exit.
+#[test]
+fn a_playlist_probe_refused_for_one_entry_keeps_every_other_entrys_subtitle_plan() {
+    let rig = Rig::new("probe_refused");
+    fs::write(
+        rig.stub.join("scan.txt"),
+        "1\tvidpend0001\tKeep One\tStub List\n\
+         2\tvidgone0002\tGone Since\tStub List\n\
+         Stub List [PLstub]\n",
+    )
+    .unwrap();
+    fs::write(rig.stub.join("probe.txt"), "1\tvidpend0001\the\t{\"he\": [{\"name\": \"Hebrew\"}]}\t{}\n").unwrap();
+    fs::write(rig.stub.join("probe_errors.txt"), "ERROR: [youtube] vidgone0002: Video unavailable. This video has been removed").unwrap();
+    fs::write(rig.stub.join("archive_adds.txt"), "youtube vidpend0001\nyoutube vidgone0002\n").unwrap();
+
+    let out = rig.dl("ok", "https://www.youtube.com/playlist?list=PLstub", &[]);
+    let all = text(&out);
+    assert!(all.contains("downloading 1 entry (subs: he)"), "the answered entry keeps its plan: {all}");
+    assert!(all.contains("Video unavailable"), "and the refusal is still shown: {all}");
+}
+
 
 #[test]
 fn the_subtitle_pass_reports_audio_files_as_tag_carriers_and_skips_them() {
@@ -1554,7 +1587,7 @@ fn a_repair_adds_what_each_video_lacks_and_a_second_run_finds_nothing_to_do() {
     rig.extra_path = ffmpeg_dir.clone();
     let dir = ffmpeg_dir.as_deref();
     let english = [("en", "English")];
-    let whole = Laid { cover: Cover::Attached, subtitles: &english, tags: true, chapters: true };
+    let whole = Laid { cover: Cover::Attached, subtitles: &english, tags: true, chapters: true, source: None };
     let files = [
         ("20200101__Whole__vidwhole001.mkv", whole),
         ("20200101__Bare__vidbare0002.mkv", BARE),
@@ -1696,7 +1729,7 @@ fn checking_says_what_each_video_lacks_and_changes_nothing() {
     let english = [("en", "English")];
     let whole = "x__vidwhole001.mkv";
     let bare = "x__vidbare0002.mkv";
-    lay_video(dir, &rig.into.join(whole), Laid { cover: Cover::Attached, subtitles: &english, tags: true, chapters: true });
+    lay_video(dir, &rig.into.join(whole), Laid { cover: Cover::Attached, subtitles: &english, tags: true, chapters: true, source: None });
     lay_video(dir, &rig.into.join(bare), BARE);
     let facts = [facts_line("vidwhole001", "en", &english, &[]), facts_line("vidbare0002", "en", &english, &[])];
     fs::write(rig.stub.join("facts.txt"), facts.join("\n")).unwrap();
@@ -1774,10 +1807,10 @@ fn every_youtube_download_below_is_found_by_its_id_and_each_copy_completed() {
     fs::create_dir_all(&playlist).unwrap();
     fs::write(playlist.join(".dl_video_archive.txt"), "youtube vidnest0001\n").unwrap();
     let nested = playlist.join("001__20200101__Nested__vidnest0001.mkv");
-    lay_video(dir, &nested, Laid { cover: Cover::None, subtitles: &english, tags: true, chapters: true });
+    lay_video(dir, &nested, Laid { cover: Cover::None, subtitles: &english, tags: true, chapters: true, source: None });
     lay_audio(dir, &rig.into.join("Nested__vidnest0001.opus"), true);
     fs::write(rig.into.join("x__vidwebm0002.webm"), b"a webm").unwrap();
-    fs::write(rig.into.join("Some clip [abc123].mp4"), b"another site's").unwrap();
+    lay_video(dir, &rig.into.join("Some clip [abc123].mp4"), Laid { source: Some("https://vimeo.com/abc123"), ..BARE });
     fs::write(rig.stub.join("facts.txt"), facts_line("vidnest0001", "en", &english, &[])).unwrap();
     fs::write(rig.stub.join("subs_served.txt"), "en\n").unwrap();
     draw_picture(dir, &rig.stub.join("thumb.jpg"), "green");
@@ -1790,7 +1823,7 @@ fn every_youtube_download_below_is_found_by_its_id_and_each_copy_completed() {
     let audio = under(&all, "Nested__vidnest0001.opus [vidnest0001]");
     assert!(audio.contains("missing: subtitles (en), chapters (2)") && audio.contains("subtitles embedded: en"), "{audio}");
     assert!(under(&all, "vidwebm0002").contains("not an mkv"), "{all}");
-    assert!(!all.contains("Some clip"), "{all}");
+    assert!(!all.contains("Some clip") && all.contains("1 file(s) from other sites (vimeo.com) — passed over"), "{all}");
     assert!(all.contains("repair: 2 completed, 1 passed over (no mkv)"), "{all}");
     let asked = rig.calls();
     let asked = asked.lines().find(|line| line.contains("%(chapters)")).expect("YouTube was asked");
@@ -1817,4 +1850,132 @@ fn a_large_library_is_asked_about_in_parts_each_counted_off() {
     assert_eq!(parts.len(), 2, "{calls}");
     assert!(parts.iter().all(|part| part.contains("--sleep-requests 1")), "a library this size is paced: {calls}");
     assert_eq!(parts[1].matches("watch?v=").count(), 1, "the second part asks about the one left: {}", parts[1]);
+}
+
+/// A cookie import asked for among a repair's options is made first, and the repair goes ahead
+/// whatever came of it, as a download would; asked for alone, the import is the whole run, and its
+/// outcome the exit code. Shown with a target no import can serve, refused before anything is
+/// touched.
+#[test]
+fn a_cookie_import_comes_before_a_repair_on_its_line_and_alone_is_the_whole_run() {
+    let rig = Rig::new("repair_import");
+    let jars = rig.root.join("jars");
+    let import = ["--cookies-extract-for-domain".as_ref(), "tiktok2".as_ref(), jars.as_os_str()];
+    let both = rig.vidl("ok").arg("repair").args(import).arg(&rig.into).output().expect("run vidl");
+    let all = text(&both);
+    assert!(all.contains("isn't a site I can target"), "the import was made: {all}");
+    assert!(all.contains("no downloaded YouTube videos"), "and then the repair: {all}");
+    assert_eq!(both.status.code(), Some(0), "the repair's outcome is the run's: {all}");
+    let alone = rig.vidl("ok").args(import).output().expect("run vidl");
+    let all = text(&alone);
+    assert_eq!(alone.status.code(), Some(1), "an import that fails is a run that fails: {all}");
+    assert!(!all.contains("a URL is required"), "and no download was missed: {all}");
+}
+
+/// One file named alone is completed alone — known by the id in its name or, renamed, by the page
+/// its metadata says it came from — and the files beside it are neither asked about nor touched.
+#[test]
+fn one_file_named_alone_is_completed_alone_known_by_its_name_or_by_the_page_its_metadata_names() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("repair of one file") else { return };
+    let mut rig = Rig::new("repair_one");
+    rig.extra_path = ffmpeg_dir.clone();
+    let dir = ffmpeg_dir.as_deref();
+    let renamed = rig.into.join("Talk (final cut).mkv");
+    let named = rig.into.join("x__vidname0002.mkv");
+    let beside = rig.into.join("x__vidnext0003.mkv");
+    lay_video(dir, &renamed, Laid { source: Some("https://www.youtube.com/watch?v=vidrnmd0001"), ..BARE });
+    lay_video(dir, &named, BARE);
+    lay_video(dir, &beside, BARE);
+    let facts = [facts_line("vidrnmd0001", "en", &[], &[]), facts_line("vidname0002", "en", &[], &[])];
+    fs::write(rig.stub.join("facts.txt"), facts.join("\n")).unwrap();
+    draw_picture(dir, &rig.stub.join("thumb.jpg"), "green");
+    let beside_before = fs::read(&beside).unwrap();
+
+    let out = rig.repair_at(&renamed, &[]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(all.contains("YouTube video [vidrnmd0001]"), "known by the page its metadata names: {all}");
+    assert!(under(&all, "Talk (final cut).mkv").contains("thumbnail embedded"), "{all}");
+    assert_eq!(held(&renamed).covers, 1);
+    let calls = rig.calls();
+    let asked: Vec<&str> = calls.lines().filter(|line| line.contains("%(chapters)")).collect();
+    assert!(asked.len() == 1 && asked[0].matches("watch?v=").count() == 1 && asked[0].contains("vidrnmd0001"), "about it alone: {calls}");
+
+    let checked = rig.repair_at(&named, &["--check"]);
+    let all = text(&checked);
+    assert_eq!(checked.status.code(), Some(1), "a file lacking something fails a check: {all}");
+    assert!(all.contains("YouTube video [vidname0002]") && all.contains("nothing was changed"), "{all}");
+    assert_eq!(held(&named).covers, 0, "checked, not changed");
+    assert_eq!(fs::read(&beside).unwrap(), beside_before, "the file beside them is left as it was");
+}
+
+/// What a repair shares with a download reaches what the repair does: `--allow-ipv6` lifts the IPv4
+/// pin and `--cookies-use` hands over its jar on the question YouTube is asked, and
+/// `--no-thumbnail` leaves the cover out of what a video is held to.
+#[test]
+fn a_repairs_shared_options_reach_what_it_asks_and_what_it_looks_for() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("a repair's shared options") else { return };
+    let mut rig = Rig::new("repair_shared");
+    rig.extra_path = ffmpeg_dir.clone();
+    lay_video(ffmpeg_dir.as_deref(), &rig.into.join("x__vidshar0001.mkv"), BARE);
+    fs::write(rig.stub.join("facts.txt"), facts_line("vidshar0001", "en", &[], &[])).unwrap();
+    let jar = rig.root.join("cookies.txt");
+    fs::write(&jar, "# Netscape HTTP Cookie File\n").unwrap();
+
+    let out = rig.repair(&["--check", "--allow-ipv6", "--no-thumbnail", "--cookies-use", jar.to_str().unwrap()]);
+    let all = text(&out);
+    let calls = rig.calls();
+    let asked = calls.lines().find(|line| line.contains("%(chapters)")).expect("YouTube was asked");
+    assert!(!asked.contains("--force-ipv4") && asked.contains(&format!("--cookies {}", jar.display())), "{asked}");
+    let missing = under(&all, "vidshar0001");
+    assert!(missing.contains("missing: metadata") && !missing.contains("thumbnail"), "{missing}");
+    rig.repair(&["--check"]);
+    let pinned = rig.calls();
+    assert!(pinned.lines().filter(|line| line.contains("%(chapters)")).nth(1).is_some_and(|line| line.contains("--force-ipv4")), "{pinned}");
+}
+
+/// A folder repair knows each video as a lone file is known: a renamed download by the page its
+/// metadata names — so it is no longer reported gone from its archive — while another site's file
+/// is named by its site and passed over, one nothing tells the origin of is counted and passed
+/// over, and a file a pass had in hand is never read at all. Named alone, each says as much.
+#[test]
+fn a_folder_repair_knows_a_renamed_download_by_its_metadata_and_names_what_it_passes_over() {
+    let Some(ffmpeg_dir) = ffmpeg_or_skip("repair by metadata") else { return };
+    let mut rig = Rig::new("repair_origins");
+    rig.extra_path = ffmpeg_dir.clone();
+    let dir = ffmpeg_dir.as_deref();
+    let renamed = rig.into.join("Talk (final cut).mkv");
+    let vimeo = rig.into.join("Some Clip [76979871].mkv");
+    let holiday = rig.into.join("holiday.mkv");
+    let in_hand = rig.into.join("x__vidtemp0004.tagging.mkv");
+    lay_video(dir, &renamed, Laid { source: Some("https://www.youtube.com/watch?v=vidrnmd0001"), ..BARE });
+    lay_video(dir, &vimeo, Laid { source: Some("https://vimeo.com/76979871"), ..BARE });
+    lay_video(dir, &holiday, BARE);
+    fs::write(&in_hand, b"half written").unwrap();
+    fs::write(rig.into.join("notes.txt"), b"no media at all").unwrap();
+    fs::write(rig.into.join(".dl_video_archive.txt"), "youtube vidrnmd0001\n").unwrap();
+    fs::write(rig.stub.join("facts.txt"), facts_line("vidrnmd0001", "en", &[], &[])).unwrap();
+    draw_picture(dir, &rig.stub.join("thumb.jpg"), "green");
+    let vimeo_before = fs::read(&vimeo).unwrap();
+
+    let out = rig.repair(&[]);
+    let all = text(&out);
+    assert!(out.status.success(), "{all}");
+    assert!(under(&all, "Talk (final cut).mkv").contains("thumbnail embedded"), "{all}");
+    assert!(all.contains("repair: 1 file(s) from other sites (vimeo.com) — passed over"), "{all}");
+    assert!(all.contains("repair: 1 media file(s) say nothing of where they were downloaded from"), "{all}");
+    assert!(!all.contains("archived, but with no file"), "the renamed download is the archived one: {all}");
+    assert!(!all.contains("could not be read"), "neither a file in a pass's hands nor one of no media kind is read: {all}");
+    assert!(all.contains("repair: 1 completed"), "{all}");
+    assert_eq!(fs::read(&vimeo).unwrap(), vimeo_before, "another site's file is left as it is");
+    assert_eq!(fs::read(&in_hand).unwrap(), b"half written");
+
+    let asked_before = rig.calls().lines().count();
+    let alone = rig.repair_at(&vimeo, &[]);
+    assert_eq!(alone.status.code(), Some(0), "passed over, as in a folder: {}", text(&alone));
+    assert!(text(&alone).contains("was downloaded from vimeo.com — passed over"), "{}", text(&alone));
+    let unknown = rig.repair_at(&holiday, &[]);
+    assert_eq!(unknown.status.code(), Some(1), "a file named alone that nothing tells of fails: {}", text(&unknown));
+    assert!(text(&unknown).contains("nothing says where"), "{}", text(&unknown));
+    assert_eq!(rig.calls().lines().count(), asked_before, "YouTube is asked about neither");
 }

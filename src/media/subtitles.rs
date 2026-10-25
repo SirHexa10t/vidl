@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 
-use crate::util::exec::capture_stdout;
+use crate::util::exec::{capture_output, capture_stdout};
 use crate::Env;
 use crate::ytdlp::{seeded, ytdlp_invocation};
 
@@ -136,7 +136,16 @@ pub(crate) fn batch_probe(url: &str, indexes: &[String], env: Env) -> Vec<Planne
         url.into(),
     ]);
     let (program, args) = ytdlp_invocation(argv);
-    capture_stdout(program, args).map(|out| parse_batch(&out)).unwrap_or_default()
+    // Read whatever came back whatever the exit status: with `--ignore-errors`, one entry refused (a
+    // private or removed video) still exits 1, after printing every other entry's answer — and a
+    // probe read only on success would hand every entry the English default for one bad one.
+    match capture_output(program, args) {
+        Some((_, out, err)) => {
+            eprint!("{err}");
+            parse_batch(&out)
+        }
+        None => Vec::new(),
+    }
 }
 
 /// Parse [`batch_probe`]'s lines into per-entry plans.

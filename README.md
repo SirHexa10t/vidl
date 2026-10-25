@@ -20,6 +20,7 @@ vidl 'https://vimeo.com/12345' --audio
 |---|---|---|
 | `yt-dlp` | **required** | Found on `PATH`, or named through `tools::install`. |
 | `ffmpeg` + `ffprobe` | **required in practice** | Merging video+audio, muxing subtitle tracks, attaching cover art. Without them you get single-stream downloads and nothing else. |
+| `python3` | **required** to import cookies | `--cookies-extract-for-domain` copies one site's rows out of a browser's cookie database with it, and every run using an imported store checks it for expired cookies — through the standard library's `sqlite3` alone, so there is nothing to `pip install`. Found on `PATH`, or named through `tools::install`. Without it an import fails, saying so, and the expiry warning never comes. |
 | `deno` | recommended | YouTube serves obfuscated player JavaScript that computes a media URL's signature. yt-dlp needs a JS runtime to execute it; without one, YouTube downloads lose formats or throttle. Any runtime yt-dlp recognises will do (`node`, `bun`, `quickjs`). |
 | `pycryptodomex` | recommended | A Python package in yt-dlp's own environment (`pip install pycryptodomex`), not a system binary. Lets yt-dlp decrypt AES-128 HLS streams *itself*; without it every such download is handed to ffmpeg, which ignores `--concurrent-fragments`, reports no incremental progress, and is markedly slower. Many broadcasters serve nothing else. |
 | `curl` | recommended | Fetches each YouTube video's thumbnail from the image CDN, which every run embeds unless `--no-thumbnail`. Without it, each video's thumbnail fails, and is reported so. |
@@ -34,8 +35,9 @@ missing, which is why the table above is worth reading before a first run: a mac
 ```
 cargo build --release      # target/release/vidl
 cargo test                 # hermetic: no network. A yt-dlp on PATH adds a few offline
-                           # checks of what it does with an output template; without one
-                           # those skip with a visible SKIPPED line
+                           # checks of what it does with an output template, and a python3
+                           # with sqlite3 the cookie-import tests; without them those skip
+                           # with a visible SKIPPED line
 ./TEST.sh                  # the above plus the live network tests
 ```
 
@@ -60,18 +62,21 @@ embeds one into each. Every pass that rewrites a file carries its cover through 
 cover an earlier remux turned into a plain video track — which players list as one more video and
 thumbnailers ignore — is restored by the thumbnail pass, without fetching another.
 
-**Completing what is already here (`vidl repair`).** `vidl repair [DIR]` adds to every YouTube
-video under DIR (the folder you are in, by default), collection folders included, the data a
-download of it would hold now and it lacks — data taken never to have been fetched as it should
-have been. That covers its thumbnail, its subtitle tracks (as tags, in an audio extraction) and
-their auto-generated marks, its metadata tags and its chapters. Videos are found by the id in their
-file names, never by title, since a title can change on YouTube. A file only gains: a tag it has
+**Completing what is already here (`vidl repair`).** `vidl repair [PATH]` adds to every YouTube
+video under PATH (the folder you are in, by default), collection folders included — or to the one
+video file PATH names — the data a download of it would hold now and it lacks — data taken never to
+have been fetched as it should have been. That covers its thumbnail, its subtitle tracks (as tags,
+in an audio extraction) and their auto-generated marks, its metadata tags and its chapters. Videos
+are known by the id in their file names or, for a renamed file, by the page its metadata says it
+was downloaded from — never by title, since a title can change on YouTube. A file from another site
+is named and passed over, as is one nothing tells the origin of. A file only gains: a tag it has
 keeps its value, and nothing is downloaded again. YouTube is asked about every video once, fifty
 at a time, each part counted off as it is answered. Whatever can't be added is named with its
 reason (a refused probe, a rate-limited caption, the image server) and makes the run exit 1. The
 archives are read too, so an archived video with no file left is reported. `vidl repair --check`
-only says what each video lacks. Only what the container can hold is expected: Ogg has no room for
-a description beside its comment, for one, and `.wav` keeps no chapters.
+only says what each video lacks. A repair's options go after `repair` (`vidl repair --no-cookies`);
+those before it are a download's, and refused. Only what the container can hold is expected: Ogg
+has no room for a description beside its comment, for one, and `.wav` keeps no chapters.
 
 **Names that fit.** Many sites put a whole post caption in the video's title, which is how a
 "title" of several hundred characters reaches a filesystem that refuses any path component over
@@ -145,7 +150,7 @@ The CLI is a thin shell over the library, and both can do the same things:
 
 ```rust
 // Everything the binary does, from the same arguments it parses.
-let code = vidl::run(args);
+let code = vidl::Cli::parse_from(argv).run();
 
 // Or drive it directly.
 let env = vidl::Env { audio: true, res: Some(1080), ..Default::default() };
@@ -157,11 +162,13 @@ match vidl::classify(url, false) {
 ```
 
 `Env::default()` is what a command line given only the URL asks for, thumbnails included.
-`vidl::repair(dir, env, check)` is `vidl repair` from code: it returns the exit code the
+`vidl::repair(path, env, check)` is `vidl repair` from code: it returns the exit code the
 command line would give.
 
 An embedder with its own command line flattens `vidl::Args` into its parser rather than restating
-the flags, and calls `vidl::run`. To override one option — cookies acquired some other way is the
+the flags, and calls `vidl::run`; a repair command of its own flattens `vidl::RepairArgs` — every
+option a repair takes, the `vidl::GlobalArgs` it shares with a download included — and calls
+`vidl::run_repair`. To override one option — cookies acquired some other way is the
 usual case — take `args.env()`, change the field, and drive the `download_*` functions.
 
 Pinned copies of the external tools are declared once at startup:
@@ -169,7 +176,7 @@ Pinned copies of the external tools are declared once at startup:
 ```rust
 vidl::tools::install(vidl::tools::Tools {
     ytdlp: Some("/opt/yt-dlp.pyz".into()),
-    python: Some("/opt/python3".into()),   // only for a zipapp yt-dlp
+    python: Some("/opt/python3".into()),   // a zipapp yt-dlp's, and the cookie import's
     ffmpeg_dir: Some("/opt/ffmpeg/bin".into()),
     js_runtime: Some("/opt/deno".into()),
 });

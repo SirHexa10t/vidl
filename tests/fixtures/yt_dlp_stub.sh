@@ -27,18 +27,20 @@
 #     format_missing_unless_checked  the media 404 a CDN gives for a transcode that is listed but
 #                     absent, until --check-formats makes yt-dlp pick a servable one
 #
-# Probe invocations (--print) always succeed: --flat-playlist replays scan.txt, a
-# --playlist-items probe replays probe.txt, and a lone-video probe prints video_probe.txt when
-# present (else a bare id/NA/NA/NA) — except a repair's question about what YouTube offers now
-# (told apart by the chapters field only it prints), which replays facts.txt and, when
-# facts_errors.txt holds refusals, prints them to stderr and exits 1, as yt-dlp does under
-# --ignore-errors once any video was refused. A subtitle fetch (--skip-download) writes the
-# sidecar of each requested language listed in subs_served.txt, named as yt-dlp names it, and none
-# for the rest, as a 429'd track leaves none; a subs_refused file fails the whole fetch. A SUCCESSFUL download mimics the real yt-dlp's side effects:
-# it appends archive_adds.txt (if present) to the run's --download-archive (the collection
-# post-mortem reads it), appends names_adds.txt (if present) to the run's --print-to-file target
-# (the shortened-name record reads that), and copies cookie_dump.txt (if present) to a
-# `--cookies <file>` target (the cookie-readability check reads that).
+# Probe invocations (--print) succeed: --flat-playlist replays scan.txt, a --playlist-items probe
+# replays probe.txt — then, when probe_errors.txt holds refusals, prints them to stderr and exits 1,
+# as yt-dlp does under --ignore-errors once any entry was refused — and a lone-video probe prints
+# video_probe.txt when present (else a bare id/NA/NA/NA) — except a repair's question about what
+# YouTube offers now (told apart by the chapters field only it prints), which replays facts.txt and,
+# when facts_errors.txt holds refusals, prints them to stderr and exits 1, as yt-dlp does under
+# --ignore-errors once any video was refused. A subtitle fetch (--skip-download) writes the sidecar
+# of each requested language listed in subs_served.txt, named as yt-dlp names it, and none for the
+# rest, as a 429'd track leaves none; a subs_refused file fails the whole fetch. A SUCCESSFUL
+# download mimics the real yt-dlp's side effects: it appends archive_adds.txt (if present) to the
+# run's --download-archive (the collection post-mortem reads it), appends names_adds.txt (if
+# present) to the run's --print-to-file target (the shortened-name record reads that), and copies
+# cookie_dump.txt (if present) to a `--cookies <file>` target (the cookie-readability check reads
+# that).
 
 args=" $* "
 dir="${VIDL_STUB_DIR:?VIDL_STUB_DIR must point at the test scratch dir}"
@@ -137,6 +139,10 @@ fi
 if [[ "$args" == *" --print "* ]]; then
     if [[ "$args" == *" --playlist-items "* ]]; then
         emit "$dir/probe.txt"
+        if [[ -s "$dir/probe_errors.txt" ]]; then
+            printf '%s\n' "$(<"$dir/probe_errors.txt")" >&2
+            exit 1
+        fi
     elif [[ -f "$dir/video_probe.txt" ]]; then
         emit "$dir/video_probe.txt"
     else

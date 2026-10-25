@@ -23,7 +23,7 @@ pub struct Tools {
     /// A python interpreter, used for two things. It runs a yt-dlp *zipapp* — a real yt-dlp binary
     /// ignores it, but a zipapp's `env python3` shebang would otherwise pick up whatever the
     /// caller's PATH offers, which is how the wrong interpreter (without curl_cffi) gets used. And
-    /// it runs the cookie-store filter's sqlite work (see [`crate::cookies::filter`]), which needs
+    /// it runs the cookie-store filter's sqlite work (see `cookies::filter`), which needs
     /// nothing but the standard library's `sqlite3` module.
     pub python: Option<OsString>,
     /// The directory holding `ffmpeg` and `ffprobe` — the muxing and inspection behind every

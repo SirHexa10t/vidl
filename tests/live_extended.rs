@@ -108,17 +108,34 @@ fn find_by_id(dir: &Path, id: &str) -> Option<PathBuf> {
 /// directly, so a live session can live outside this checkout — then at `tests/cookies/`, which
 /// `.gitignore` keeps untracked. See `tests/cookies/README.md`.
 fn cookie_flags_or_skip(test: &str, site: &str) -> Option<[String; 2]> {
-    let supplied = std::env::var_os("VIDL_TEST_COOKIES").map(PathBuf::from);
-    let base = match &supplied {
-        // Pointed straight at a jar: use it, and let the emptiness check below have the last word.
-        Some(path) if path.is_file() => return netscape_jar(path).or_else(|| skip(test, site)),
-        Some(path) => path.clone(),
-        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cookies"),
-    };
+    let base = supplied_cookies();
+    // Pointed straight at a jar: use it, and let the emptiness check below have the last word.
+    if base.is_file() {
+        return netscape_jar(&base).or_else(|| skip(test, site));
+    }
     browser_store(&base.join(site))
         .or_else(|| browser_store(&base))
         .or_else(|| netscape_jar(&base.join(format!("{site}.txt"))))
         .or_else(|| skip(test, site))
+}
+
+/// Where a supplied session is looked for: `$VIDL_TEST_COOKIES`, else `tests/cookies/`.
+fn supplied_cookies() -> PathBuf {
+    std::env::var_os("VIDL_TEST_COOKIES")
+        .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cookies"), PathBuf::from)
+}
+
+/// Skip-with-notice: the supplied youtube session as a browser store — the `browser.spec` beside a
+/// `store/` that an import writes — as a `--cookies-from-browser` spec, searched where
+/// [`cookie_flags_or_skip`] searches; `None` after a visible SKIP line otherwise, a Netscape jar
+/// included, that being no store to read back.
+fn imported_store_or_skip(test: &str) -> Option<String> {
+    let base = supplied_cookies();
+    let store = browser_store(&base.join("youtube")).or_else(|| browser_store(&base));
+    if store.is_none() {
+        eprintln!("SKIPPED {test}: no youtube browser store supplied (see tests/cookies/README.md)");
+    }
+    store.map(|[_, spec]| spec)
 }
 
 fn skip(test: &str, site: &str) -> Option<[String; 2]> {
@@ -252,5 +269,37 @@ fn an_age_restricted_video_downloads_with_supplied_cookies() {
         text(&out)
     );
     assert!(find_by_id(&dir, RESTRICTED_ID).is_some(), "the restricted video landed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The store an import writes is one the genuine yt-dlp loader reads: its filtered, per-site copy
+/// of a browser's cookie DB, handed over as `--cookies-from-browser`, dumps rows. It reads the real
+/// session ON PURPOSE — that is what it tests — and sends no network requests.
+#[test]
+#[ignore = "live-extended (cookies): reads a supplied store through the real yt-dlp; run via TEST.sh"]
+fn an_imported_store_reads_back_through_the_real_ytdlp() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(spec) = imported_store_or_skip("store read-back") else { return };
+    // Offline on purpose: no URL, so yt-dlp only extracts the store to a throwaway Netscape
+    // file — the genuine loader validating what our filter wrote, with zero requests sent.
+    // Modern yt-dlp then exits 2 ("You must provide at least one URL"), but only AFTER writing
+    // the jar — the same tolerated-failure shape the product's readability check relies on. The
+    // dump on disk is the verdict, not the exit code.
+    let dir = scratch("readback");
+    let probe = dir.join("probe-cookies.txt");
+    let out = Command::new(tool("yt-dlp"))
+        .args(["--cookies-from-browser", &spec, "--cookies"])
+        .arg(&probe)
+        .output()
+        .expect("run yt-dlp");
+    let dump = std::fs::read_to_string(&probe).unwrap_or_else(|_| {
+        panic!("no cookie dump written — the loader failed outright:\n{}", text(&out))
+    });
+    let cookies = dump
+        .lines()
+        .map(|line| line.strip_prefix("#HttpOnly_").unwrap_or(line)) // an HttpOnly row is a cookie too
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .count();
+    assert!(cookies > 0, "the real loader must read rows out of the imported store:\n{dump}");
     let _ = std::fs::remove_dir_all(&dir);
 }

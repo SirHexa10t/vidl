@@ -1,11 +1,14 @@
 //! `vidl repair`: add to downloaded videos the data a download of them would hold now and they
 //! lack — the thumbnail, subtitle tracks and their auto-generated marks, the metadata tags and
-//! chapters a download embeds — in a folder and every collection folder below it, without
-//! downloading a video again. What a file lacks is taken never to have been fetched as it should
-//! have been: by an older version, or refused by YouTube at the time.
+//! chapters a download embeds — in a folder and every collection folder below it, or in one file,
+//! without downloading a video again. What a file lacks is taken never to have been fetched as it
+//! should have been: by an older version, or refused by YouTube at the time.
 //!
-//! A file is found by the YouTube id its name carries (`…__<id>.<ext>`, as every YouTube template
-//! here ends it), never by its title: a video can be retitled on YouTube, its id cannot. Two files
+//! A file is known by the YouTube id its name carries (`…__<id>.<ext>`, as every YouTube template
+//! here ends it), or else by the page its metadata says it was downloaded from ([`source_url`]) — a
+//! renamed download is still found — and never by its title: a video can be retitled on YouTube,
+//! its id cannot. A file from another site is named and passed over, as is one nothing tells the
+//! origin of. Two files
 //! with one id are two copies of one video — a video beside its audio extraction, one video in two
 //! playlists — and each gets what fits its kind. The download archives say what was
 //! downloaded: an archived id with no file left is reported, and an entry from another site is
@@ -56,17 +59,48 @@ const KEEPS: &[(&str, &[&str], bool)] = &[
     (".wav", &["description", "synopsis", "purl"], false),
 ];
 
-/// Add to every downloaded YouTube video under `root` the data it lacks — or, with `check`, only say
-/// what each one lacks, adding nothing. Returns the exit code: 1 when a file is left lacking
-/// something it could hold (checking: lacks anything), or could not be checked; 0 otherwise.
-pub fn repair(root: &Path, env: Env, check: bool) -> i32 {
-    let library = survey(root);
-    if library.files.is_empty() {
-        println!("repair: no downloaded YouTube videos under {}", root.display());
-        report_archive(root, &library);
-        return 0;
+/// Add to every downloaded YouTube video under `path` — a folder and every folder below it, or the
+/// one file `path` names — the data it lacks; or, with `check`, only say what each one lacks,
+/// adding nothing. Returns the exit code: 1 when a file is left lacking something it could hold
+/// (checking: lacks anything) or could not be checked — the one file named included, when nothing
+/// tells where it came from; 0 otherwise.
+pub fn repair(path: &Path, env: Env, check: bool) -> i32 {
+    if path.is_dir() {
+        let library = survey(path);
+        if library.files.is_empty() {
+            println!("repair: no downloaded YouTube videos under {}", path.display());
+            report_unreached(path, &library);
+            return 0;
+        }
+        println!("repair: {} video file(s) under {}", library.files.len(), path.display());
+        return complete(path, &library, env, check);
     }
-    println!("repair: {} video file(s) under {}", library.files.len(), root.display());
+    let shown = path.display();
+    match origin(path) {
+        Origin::YouTube(id) => {
+            println!("repair: {shown}, YouTube video [{id}]");
+            let library = Library { files: vec![Found { path: path.to_path_buf(), id }], ..Library::default() };
+            complete(path.parent().unwrap_or(Path::new("")), &library, env, check)
+        }
+        Origin::Elsewhere(host) => {
+            println!("repair: {shown} was downloaded from {host} — passed over: a repair completes YouTube videos only");
+            0
+        }
+        Origin::Unknown => {
+            let why = "no YouTube id in its name, and no source URL in its metadata";
+            eprintln!("{}", style::problematic(&format!("repair: nothing says where {shown} was downloaded from — {why}")));
+            1
+        }
+        Origin::Unreadable => {
+            eprintln!("{}", style::problematic(&format!("repair: could not read {shown} (ffprobe), and its name carries no YouTube id")));
+            1
+        }
+    }
+}
+
+/// [`repair`]'s work on the videos of `library`, found under `root`: YouTube asked about each, each
+/// completed or checked and said, then what was passed over, then the run's counts.
+fn complete(root: &Path, library: &Library, env: Env, check: bool) -> i32 {
     // Asked about once per video, whatever copies of it there are — and not at all for one only
     // held in a container nothing is added to.
     let mut ids: Vec<String> = Vec::new();
@@ -90,12 +124,12 @@ pub fn repair(root: &Path, env: Env, check: bool) -> i32 {
         }
         totals.count(outcome);
     }
-    report_archive(root, &library);
+    report_unreached(root, library);
     println!("repair{}: {}", if check { " --check" } else { "" }, totals.summary(check));
     i32::from(totals.left_wanting())
 }
 
-/// A downloaded YouTube video file, and the id its name carries.
+/// A downloaded YouTube video file, and its id.
 struct Found {
     path: PathBuf,
     id: String,
@@ -104,14 +138,81 @@ struct Found {
 /// What lies under the folder a repair was pointed at.
 #[derive(Default)]
 struct Library {
-    /// Every file named for a YouTube video.
+    /// Every file of a YouTube video.
     files: Vec<Found>,
     /// Every download-archive entry: `(extractor, id)`.
     archived: Vec<(String, String)>,
+    /// Every media file from another site, with the site's host.
+    elsewhere: Vec<(PathBuf, String)>,
+    /// How many media files nothing tells the origin of ([`Origin::Unknown`]).
+    unknown: usize,
+    /// How many media files with no id in the name ffprobe could not read.
+    unreadable: usize,
 }
 
-/// Walk `root` and every folder below it — one it cannot read is passed over — for the files named
-/// for a YouTube video, and the download archives.
+impl Library {
+    /// Count `path` in by where it came from.
+    fn take(&mut self, path: PathBuf, origin: Origin) {
+        match origin {
+            Origin::YouTube(id) => self.files.push(Found { path, id }),
+            Origin::Elsewhere(host) => self.elsewhere.push((path, host)),
+            Origin::Unknown => self.unknown += 1,
+            Origin::Unreadable => self.unreadable += 1,
+        }
+    }
+}
+
+/// Where a media file came from, as far as a repair can tell.
+#[derive(Debug, PartialEq)]
+enum Origin {
+    /// A YouTube video, by its id.
+    YouTube(String),
+    /// Another site, by the host of the page it came from.
+    Elsewhere(String),
+    /// Nothing says: no YouTube id in its name, no source URL in its metadata.
+    Unknown,
+    /// Its name carries no id, and ffprobe could not read its metadata.
+    Unreadable,
+}
+
+/// Where `file` came from: the YouTube id its name carries, or else the page its metadata names.
+fn origin(file: &Path) -> Origin {
+    if let Some(id) = youtube_id(&file.file_name().unwrap_or_default().to_string_lossy()) {
+        return Origin::YouTube(id.to_string());
+    }
+    match tags_and_chapters(file, is_audio(file)) {
+        Some((tags, _)) => origin_in_tags(&tags),
+        None => Origin::Unreadable,
+    }
+}
+
+/// Where a file came from by its tags: YouTube's video when [`source_url`] is a YouTube watch page,
+/// another site's when it is that site's — and nothing known when there is none, or it is a YouTube
+/// page that names no video.
+fn origin_in_tags(tags: &[(String, String)]) -> Origin {
+    let Some(url) = source_url(tags) else { return Origin::Unknown };
+    if !crate::is_youtube(url) {
+        return Origin::Elsewhere(crate::host_of(url));
+    }
+    crate::id_from_url(url).map_or(Origin::Unknown, Origin::YouTube)
+}
+
+/// The page a file's tags say it was downloaded from: a lone URL in its `purl` tag or, failing that,
+/// its `comment` — where every download here puts the page's URL, one of the two kept by each
+/// container a download writes ([`KEEPS`]). A lone URL only: a comment of someone's own, links and
+/// all, says where else to look, not where the file came from.
+fn source_url(tags: &[(String, String)]) -> Option<&str> {
+    let lone_url = |value: &&str| {
+        (value.starts_with("https://") || value.starts_with("http://")) && !value.contains(char::is_whitespace)
+    };
+    ["purl", "comment"].into_iter().find_map(|wanted| {
+        tags.iter().filter(|(key, _)| key.eq_ignore_ascii_case(wanted)).map(|(_, value)| value.trim()).find(lone_url)
+    })
+}
+
+/// Walk `root` and every folder below it — one it cannot read is passed over — for its media files,
+/// each counted in by where it came from ([`origin`]), and the download archives. A file a download
+/// or a pass has in hand is left out ([`in_passing`]).
 fn survey(root: &Path) -> Library {
     let mut library = Library::default();
     let mut stack = vec![root.to_path_buf()];
@@ -126,8 +227,9 @@ fn survey(root: &Path) -> Library {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == ARCHIVE_NAME {
                 library.archived.extend(archive_entries(&std::fs::read_to_string(&path).unwrap_or_default()));
-            } else if let Some(id) = youtube_id(&name) {
-                library.files.push(Found { id: id.to_string(), path });
+            } else if is_media_name(&name) && !in_passing(&name) {
+                let origin = origin(&path);
+                library.take(path, origin);
             }
         }
     }
@@ -146,9 +248,51 @@ fn youtube_id(name: &str) -> Option<&str> {
     named.then_some(id)
 }
 
-/// Say what the archives hold that no repair can reach: an archived YouTube id with no file left
-/// under `root`, and the entries from other sites.
-fn report_archive(root: &Path, library: &Library) {
+/// Whether `name` ends in an extension a download writes ([`VIDEO_EXTS`], [`AUDIO_EXTS`]).
+fn is_media_name(name: &str) -> bool {
+    VIDEO_EXTS.iter().chain(&AUDIO_EXTS).any(|ext| name.ends_with(ext))
+}
+
+/// Whether `name` is one a file only has in passing: it holds the `__<id>.` that ends every YouTube
+/// name here, but not at its end — a pass's temporary copy (`…__<id>.tagging.mkv`), a stream yt-dlp
+/// has yet to merge (`…__<id>.f137.mp4`). Its metadata is someone else's, or not yet written.
+fn in_passing(name: &str) -> bool {
+    let id_byte = |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_');
+    youtube_id(name).is_none()
+        && name.as_bytes().windows(14).any(|window| window.starts_with(b"__") && window[2..13].iter().all(id_byte) && window[13] == b'.')
+}
+
+/// Say what a repair passed over: the media files from other sites, by host, and those nothing
+/// tells the origin of; then what the archives hold that no repair can reach — an archived YouTube
+/// id with no file left under `root`, and the entries from other sites.
+fn report_unreached(root: &Path, library: &Library) {
+    if !library.elsewhere.is_empty() {
+        let mut hosts: Vec<&str> = library.elsewhere.iter().map(|(_, host)| host.as_str()).collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        println!(
+            "repair: {} file(s) from other sites ({}) — passed over: a repair completes YouTube videos only",
+            library.elsewhere.len(),
+            hosts.join(", ")
+        );
+    }
+    if library.unknown > 0 {
+        println!(
+            "repair: {} media file(s) say nothing of where they were downloaded from (no YouTube id in the \
+             name, no source URL in the metadata) — passed over",
+            library.unknown
+        );
+    }
+    if library.unreadable > 0 {
+        println!(
+            "{}",
+            style::problematic(&format!(
+                "repair: {} media file(s) with no YouTube id in the name could not be read (ffprobe) to tell \
+                 where they came from — passed over",
+                library.unreadable
+            ))
+        );
+    }
     let found: HashSet<&str> = library.files.iter().map(|found| found.id.as_str()).collect();
     let mut gone: Vec<&str> = Vec::new();
     let mut elsewhere = 0;
@@ -640,6 +784,41 @@ mod tests {
             "日本語日本語ab.mkv",                       // multi-byte, cut mid-character
         ] {
             assert_eq!(youtube_id(other), None, "{other}");
+        }
+    }
+
+    fn tagged(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect()
+    }
+
+    #[test]
+    fn a_file_comes_from_the_page_its_purl_or_else_its_comment_names() {
+        let watch = "https://www.youtube.com/watch?v=Q591qHMJgSI";
+        let video = Origin::YouTube("Q591qHMJgSI".into());
+        assert_eq!(origin_in_tags(&tagged(&[("PURL", watch)])), video, "a key in any case");
+        assert_eq!(origin_in_tags(&tagged(&[("comment", "https://youtu.be/Q591qHMJgSI")])), video, "the comment, without a purl");
+        assert_eq!(origin_in_tags(&tagged(&[("comment", "https://vimeo.com/1"), ("purl", watch)])), video, "the purl first");
+        assert_eq!(origin_in_tags(&tagged(&[("purl", "https://vimeo.com/76979871")])), Origin::Elsewhere("vimeo.com".into()));
+        assert_eq!(
+            origin_in_tags(&tagged(&[("purl", "https://example.com/watch?v=Q591qHMJgSI")])),
+            Origin::Elsewhere("example.com".into()),
+            "another site's `v=` is no YouTube id"
+        );
+        assert_eq!(origin_in_tags(&tagged(&[("purl", "https://www.youtube.com/@someone")])), Origin::Unknown, "a page naming no video");
+        for words in ["my favourite — https://youtu.be/Q591qHMJgSI", "https://youtu.be/Q591qHMJgSI is my favourite"] {
+            assert_eq!(origin_in_tags(&tagged(&[("comment", words)])), Origin::Unknown, "a URL among someone's words: {words}");
+        }
+        assert_eq!(origin_in_tags(&tagged(&[("description", watch), ("title", watch)])), Origin::Unknown, "only purl and comment say");
+        assert_eq!(origin_in_tags(&[]), Origin::Unknown);
+    }
+
+    #[test]
+    fn a_name_a_file_only_has_in_passing_is_never_taken_for_a_download() {
+        for passing in ["x__Q591qHMJgSI.tagging.mkv", "x__Q591qHMJgSI.f137.mp4", "t___Q591qHMJgSI.temp.mkv"] {
+            assert!(in_passing(passing), "{passing}");
+        }
+        for kept in ["x__Q591qHMJgSI.mkv", "Talk (final cut).mkv", "Some Clip [vimeo123].mp4", "a__b.mkv", "日本語__日本語語.mkv"] {
+            assert!(!in_passing(kept), "{kept}");
         }
     }
 

@@ -1,12 +1,16 @@
 # Test cookies
 
-One test — `live_extended::an_age_restricted_video_downloads_with_supplied_cookies` — needs a real
-signed-in YouTube session to get past an age gate. There is no way to test that honestly without
-one, so the session is supplied out of band and never committed.
+Two tests need a real signed-in YouTube session. There is no way to test either honestly without
+one, so the session is supplied out of band and never committed:
+
+- `live_extended::an_age_restricted_video_downloads_with_supplied_cookies` gets past an age gate
+  with it — either shape below.
+- `live_extended::an_imported_store_reads_back_through_the_real_ytdlp` reads it back through the
+  genuine yt-dlp loader, offline — a browser store only, the shape an import writes.
 
 **Everything in this directory except this file is gitignored.** Check before you commit anyway.
 
-Without a session the test prints a `SKIPPED` line and passes. Nothing else in the suite needs
+Without a session each test prints a `SKIPPED` line and passes. Nothing else in the suite needs
 cookies.
 
 ## Two accepted shapes
@@ -15,8 +19,9 @@ Either works; the browser store is tried first.
 
 ### A browser store — `browser.spec` + `store/`
 
-What a tool that copies a browser profile's cookies produces, and the shape an embedder hands
-this crate. `browser.spec` holds just the browser name; `store/` holds its cookie database:
+What a tool that copies a browser profile's cookies produces — `vidl --cookies-extract-for-domain
+youtube <dir>` makes one at `<dir>/youtube` — and the shape an embedder hands this crate.
+`browser.spec` holds just the browser name; `store/` holds its cookie database:
 
 ```
 tests/cookies/browser.spec        # e.g. a single line: firefox

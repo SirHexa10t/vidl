@@ -12,7 +12,7 @@
 //!   failed-downloads ledger, playlist/channel-tab enumeration.
 //! - `media/` — working on what came *back*: thumbnail, subtitle-track and audio-tag patching,
 //!   the per-video subtitle plan drawn from the caption matrix, and [`repair`], which adds to a
-//!   folder of downloads the data each video lacks against what YouTube offers now.
+//!   folder of downloads, or to one, the data each video lacks against what YouTube offers now.
 //! - `page/` — what a *page* lists, when it lists more than one video: reached only through
 //!   `--multi`, so nothing in it runs on a page that already works.
 //! - `cookies` — what a caller's cookie arguments mean, resolved once per run into flags yt-dlp
@@ -28,10 +28,11 @@
 //!
 //! Two ways in, and they can do the same things:
 //!
-//! - [`run`] takes the CLI's own [`Args`] — the whole binary is `run(Args::parse())`, so an
-//!   embedder that wants `vidl`'s behaviour wholesale reuses the flags instead of restating them.
-//! - [`classify`] plus the `download_*` functions, driven by an [`Env`], for a caller that wants
-//!   to make the routing decision itself.
+//! - [`Cli`] is the CLI's own — the whole binary is `Cli::parse().run()` — and an embedder that
+//!   wants `vidl`'s behaviour wholesale reuses its halves instead of restating the flags: [`Args`],
+//!   a download's options, which [`run`] takes; and [`RepairArgs`], which [`run_repair`] takes.
+//! - [`classify`] plus the `download_*` functions (and [`repair`]), driven by an [`Env`], for a
+//!   caller that wants to make the routing decision itself.
 //!
 //! yt-dlp is expected on `PATH`. An embedder that pins its own copy (or bundles ffmpeg, a JS
 //! runtime, or the python behind the cookie filter) names them through [`tools::install`] once at
@@ -53,7 +54,7 @@ mod page;
 mod util;
 mod ytdlp;
 
-pub use cli::{Action, Args, run};
+pub use cli::{Action, Args, Cli, GlobalArgs, RepairArgs, run, run_repair};
 pub use media::repair::repair;
 
 /// What the user asked for, shared by every yt-dlp invocation of one run. The mirror of [`Args`]
@@ -68,7 +69,7 @@ pub struct Env<'a> {
     pub cookies: Option<&'a Path>,
     /// A browser spec (`<browser>[:<dir>]`) for yt-dlp's `--cookies-from-browser`, used on every
     /// invocation unless a cookies file overrides it. These two mirror yt-dlp's own pair of flags;
-    /// on the command line they are one `--cookies-use`, split by [`crate::cookies`].
+    /// on the command line they are one `--cookies-use`, split by [`GlobalArgs::env`].
     pub cookies_from_browser: Option<&'a str>,
     /// Audio-only extraction (`-x`).
     pub audio: bool,
@@ -79,8 +80,9 @@ pub struct Env<'a> {
     /// `--allow-ipv6` opts back in for an IPv6-only network.
     pub allow_ipv6: bool,
     /// Embed a cover-art thumbnail — on unless the command line says `--no-thumbnail`, and on in
-    /// [`Default`] too. A late, idempotent pass handles it, so the main download stays fast and a
-    /// re-run patches previously-downloaded videos; an audio download gets none ([`thumbnails`]).
+    /// [`Default`] too. A download embeds it in a late, idempotent pass, so the main download stays
+    /// fast and a re-run patches previously-downloaded videos; a repair adds it with whatever else a
+    /// video lacks. An audio file gets none (see `thumbnails`).
     pub thumbnail: bool,
     /// Force the subtitle patch pass: scan a video (fresh or already on disk) for its expected
     /// subtitles and embed any that are missing. A fresh download already embeds subtitles
