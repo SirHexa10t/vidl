@@ -25,8 +25,10 @@ vidl 'https://vimeo.com/12345' --audio
 | `pycryptodomex` | recommended | A Python package in yt-dlp's own environment (`pip install pycryptodomex`), not a system binary. Lets yt-dlp decrypt AES-128 HLS streams *itself*; without it every such download is handed to ffmpeg, which ignores `--concurrent-fragments`, reports no incremental progress, and is markedly slower. Many broadcasters serve nothing else. |
 | `curl` | recommended | Fetches each YouTube video's thumbnail from the image CDN, which every run embeds unless `--no-thumbnail`. Without it, each video's thumbnail fails, and is reported so. |
 
-Rust dependencies are just two: `clap` (the CLI) and `lofty` (in-place audio tag writes). Nothing
-else is linked in, and there is no build script.
+Rust dependencies are just three: `clap` (the CLI), `lofty` (in-place audio tag writes) and
+`software_inventory` (where installed browsers keep their cookie stores, for the cookie import) —
+the last fetched from its git repository rather than crates.io. Nothing else is linked in, and
+there is no build script.
 
 None of these is checked up front. Each fails at the point of use with a message naming what was
 missing, which is why the table above is worth reading before a first run: a machine without

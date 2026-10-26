@@ -3,7 +3,7 @@ name = "vidl"
 version = "0.1.0"
 edition = "2021"
 description = "Drive yt-dlp: classify a URL, resolve per-video subtitles, download, and patch the result"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

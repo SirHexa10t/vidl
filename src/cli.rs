@@ -44,7 +44,7 @@ impl Cli {
             None => run(self.args),
             Some(Action::Repair(repair)) => {
                 if let Some(url) = &self.args.url {
-                    eprintln!("vidl: `repair` adds to what is already downloaded, and takes no URL (given {url})");
+                    eprintln!("error: `repair` adds to what is already downloaded, and takes no URL (given {url})");
                     return 2;
                 }
                 // What comes before `repair` is a download's, even an option a repair has too:
@@ -273,11 +273,11 @@ pub fn run(args: Args) -> i32 {
         _ => {}
     }
     let Some(url) = args.url.clone() else {
-        eprintln!("vidl: a URL is required (or --taglist for the flag reference; `vidl repair` completes what is downloaded)");
+        eprintln!("error: a URL is required (or --taglist for the flag reference; `vidl repair` completes what is downloaded)");
         return 2;
     };
     if let Err(err) = std::fs::create_dir_all(&args.into) {
-        eprintln!("vidl: cannot create {}: {err}", args.into.display());
+        eprintln!("error: cannot create {}: {err}", args.into.display());
         return 1;
     }
     // Settle the file-name limit ONCE, here, before any output template is built: the caller's
@@ -344,7 +344,7 @@ pub fn run_repair(repair: RepairArgs) -> i32 {
         return code;
     }
     if !repair.path.exists() {
-        eprintln!("vidl: repair: there is nothing at {}", repair.path.display());
+        eprintln!("error: there is nothing at {}", repair.path.display());
         return 2;
     }
     // What a repair asks about is YouTube, so YouTube's imported store is the one it uses.
@@ -358,7 +358,7 @@ pub fn run_repair(repair: RepairArgs) -> i32 {
 fn import_cookies(global: &GlobalArgs) -> Result<Option<bool>, i32> {
     let Some(request) = &global.cookies_extract_for_domain else { return Ok(None) };
     let Some(into) = import_destination(global) else {
-        eprintln!("vidl: --cookies-extract-for-domain needs an output directory");
+        eprintln!("error: --cookies-extract-for-domain needs an output directory");
         return Err(2);
     };
     Ok(Some(crate::cookies::import::run(&request[0], &into, read_root(global).as_deref())))
@@ -401,7 +401,7 @@ fn env_with<'a>(mut env: Env<'a>, resolved: &'a crate::cookies::Cookies) -> Opti
             env.cookies_from_browser = Some(spec);
         }
         crate::cookies::Cookies::Unusable(why) => {
-            eprintln!("{}", crate::util::style::problematic(&format!("vidl: {why}")));
+            eprintln!("{}", crate::util::style::problematic(&format!("error: {why}")));
             return None;
         }
     }
